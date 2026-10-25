@@ -117,7 +117,8 @@ impl ProcessRunner for InstalledClaude {
         if args == ["--version"] {
             return Ok("claude 1.0.0".into());
         }
-        Ok("--print --output-format --verbose --permission-mode --settings --bare --safe-mode --disable-slash-commands --no-session-persistence --no-chrome --prompt-suggestions --strict-mcp-config --tools --allowedTools --json-schema".into())
+        // V8：真实 claude 的 --help 含 --restricted（Claude 只读整理调用要用）。
+        Ok("--print --output-format --verbose --permission-mode --settings --bare --safe-mode --restricted --disable-slash-commands --no-session-persistence --no-chrome --prompt-suggestions --strict-mcp-config --tools --allowedTools --json-schema".into())
     }
 
     fn run_capture(&self, _invocation: &AgentInvocation) -> Result<(String, String), BackendError> {

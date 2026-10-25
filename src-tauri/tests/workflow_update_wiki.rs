@@ -328,7 +328,9 @@ impl ProcessRunner for SuccessfulAgent {
         _args: &[&str],
         _timeout: Duration,
     ) -> Result<String, BackendError> {
-        Ok("--print --output-format --verbose --permission-mode --settings --bare --safe-mode --disable-slash-commands --no-session-persistence --no-chrome --prompt-suggestions --strict-mcp-config --tools --allowedTools --json-schema --json --ephemeral --ignore-rules --ignore-user-config --sandbox --skip-git-repo-check -C --cd --message-file --cwd --no-auth-env-only --oneshot --query-file --format --in".into())
+        // V8：真实 claude 2.1.259 的 --help 里有 --restricted；Claude 的只读整理调用
+        // （有界规划、逐页文件模式）会带上它，启动前的参数核对需要在帮助文本里找到它。
+        Ok("--print --output-format --verbose --permission-mode --settings --bare --safe-mode --restricted --disable-slash-commands --no-session-persistence --no-chrome --prompt-suggestions --strict-mcp-config --tools --allowedTools --json-schema --json --ephemeral --ignore-rules --ignore-user-config --sandbox --skip-git-repo-check -C --cd --message-file --cwd --no-auth-env-only --oneshot --query-file --format --in".into())
     }
 
     fn run_capture(&self, _invocation: &AgentInvocation) -> Result<(String, String), BackendError> {

@@ -781,6 +781,62 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
         Ok(invocation)
     }
 
+    /// V8：Update Wiki 整理专用的只读调用配置。
+    ///
+    /// 做什么：只给两类整理调用用——
+    ///   * 有界规划（提示里只有本组来源全文和页面清单，页面正文要模型自己去读）；
+    ///   * 逐页生成的文件模式（部分或全部上下文写在租约目录的 generation-request.md 里）。
+    ///
+    /// Claude 的参数在 `chat_invocation` 的基础上只改三处：
+    ///   * `--tools=Read,Grep,Glob`：只暴露读文件、搜索、按名找文件这三个内置工具；
+    ///   * `--allowedTools=Read Grep Glob`：dontAsk 模式下只预先放行这三个，其余一律拒绝；
+    ///   * `--restricted`：claude 2.1.259 的 `--help` 写明它会去掉 Bash 等执行代码的
+    ///     工具和 WebFetch、忽略用户/项目/本地设置文件，并把文件工具限制在工作目录内
+    ///     （这里的工作目录就是本次的隔离工作区或租约目录）。
+    /// 其余安全参数（--safe-mode、沙箱设置、dontAsk、--strict-mcp-config、
+    /// --no-session-persistence 等）原样保留；不开 Edit/Write，模型改不了任何文件。
+    ///
+    /// 为什么单独做一个、不改 `chat_invocation`：聊天必须继续不带任何工具；整理里
+    /// 全部上下文都已内联的调用（全量规划、内联生成）也继续用无工具的 `chat_invocation`，
+    /// 免得模型主动去读工作区里 log.md 这类大文件。生产里给 Claude 开文件工具的先例是
+    /// 导入（`import_assistance_invocation_with_skill`）和 lint 修复（`lint_repair_program_and_args`）。
+    ///
+    /// Codex：与 `chat_invocation` 相同，`codex exec --sandbox read-only` 本来就能只读工作区。
+    /// Openclaw/Hermes：没有经过验证的只读文件工具配置，直接拒绝。调用方按
+    /// `agent_budget::has_read_only_compile_tools` 判断，本不会走到这里，这里再兜一次底，
+    /// 绝不让它们悄悄拿到默认工具。
+    ///
+    /// 注意：后端每次启动前会用 `require_operation_protocol` 逐个核对参数是否出现在
+    /// CLI 的 `--help` 里，所以 `--restricted` 也必须出现在该 CLI 的帮助文本中才能运行。
+    pub fn compile_read_only_invocation(
+        kind: AgentKind,
+        workspace: &Path,
+        prompt: &str,
+    ) -> Result<AgentInvocation, BackendError> {
+        // 与聊天/整理调用同一套工作区校验：必须是任务自有的候选目录，且含 wiki/。
+        validate_chat_workspace(workspace)?;
+        let cwd = workspace.to_path_buf();
+        match kind {
+            AgentKind::Claude => Ok(AgentInvocation {
+                program: "claude".into(),
+                args: compile_read_only_claude_args(),
+                // 提示走 stdin，不放进命令行参数（避免进程列表里出现正文、也没有长度上限问题）。
+                stdin: Some(prompt.to_string()),
+                cwd,
+            }),
+            AgentKind::Codex => Ok(text_agent_invocation(kind, workspace, prompt)),
+            AgentKind::Openclaw | AgentKind::Hermes => Err(BackendError::new(
+                "AGENT_OPERATION_PROTOCOL_UNSUPPORTED",
+                format!(
+                    "{} has no verified read-only file-tool profile for bounded Update Wiki context.",
+                    kind.command()
+                ),
+                true,
+                true,
+            )),
+        }
+    }
+
     pub fn chat_convenience_invocation(
         kind: AgentKind,
         workspace: &Path,
@@ -3857,6 +3913,39 @@ fn workspace_agent_invocation(kind: AgentKind, workspace: &Path, prompt: &str) -
     agent_one_shot_invocation(kind, workspace, prompt, true)
 }
 
+/// V8：Claude 只读整理调用的完整参数（见 `AgentService::compile_read_only_invocation`）。
+///
+/// 和 `chat_invocation` 的 Claude 参数逐项对齐，只有三处不同：
+/// `--restricted`（紧跟 `--safe-mode`）、`--tools=Read,Grep,Glob`、`--allowedTools=Read Grep Glob`。
+/// 单独拆成函数，测试可以逐项比对，防止以后有人顺手加进 Bash/Edit/Write/WebFetch。
+fn compile_read_only_claude_args() -> Vec<String> {
+    vec![
+        "--print".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        // 不弹任何权限确认：没在 --allowedTools 里的工具一律直接拒绝。
+        "--permission-mode".into(),
+        "dontAsk".into(),
+        // 关掉 CLAUDE.md、技能、插件、hooks、MCP 等一切自定义，保留登录状态。
+        "--safe-mode".into(),
+        // 去掉执行代码的工具和 WebFetch，忽略用户/项目设置文件，
+        // 并把文件工具限制在工作目录（隔离工作区或租约目录）内。
+        "--restricted".into(),
+        "--disable-slash-commands".into(),
+        "--no-session-persistence".into(),
+        "--no-chrome".into(),
+        "--prompt-suggestions=false".into(),
+        "--strict-mcp-config".into(),
+        // 只暴露并只放行三个只读工具：读文件、搜索内容、按名找文件。
+        "--tools=Read,Grep,Glob".into(),
+        "--allowedTools=Read Grep Glob".into(),
+        // 沙箱设置照旧（--restricted 不会忽略 --settings 传入的设置）。
+        "--settings".into(),
+        r#"{"sandbox":{"enabled":true}}"#.into(),
+    ]
+}
+
 fn lint_repair_program_and_args(
     kind: AgentKind,
     _workspace_arg: &str,
@@ -5462,6 +5551,160 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&claude.cwd);
+    }
+
+    // V8：Claude 的整理只读调用只开 Read/Grep/Glob，必须带 --restricted 和原有全部安全参数；
+    // 与聊天参数相比只多一个 --restricted、只换两项工具参数。聊天调用保持不带任何工具。
+    #[test]
+    fn compile_read_only_invocation_grants_only_read_grep_glob_in_restricted_mode() {
+        let workspace = std::env::temp_dir()
+            .join("llm-wiki-desktop")
+            .join(format!("compile-read-only-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join("wiki")).unwrap();
+
+        let claude =
+            AgentService::compile_read_only_invocation(AgentKind::Claude, &workspace, "plan")
+                .unwrap();
+        assert_eq!(claude.program, "claude");
+        assert_eq!(claude.cwd, workspace, "file tools are confined to this workspace");
+        assert_eq!(claude.stdin.as_deref(), Some("plan"));
+        assert!(!claude.args.contains(&"plan".to_string()), "prompt goes through stdin");
+        for required in [
+            "--restricted",
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--prompt-suggestions=false",
+            "--tools=Read,Grep,Glob",
+            "--allowedTools=Read Grep Glob",
+        ] {
+            assert!(
+                claude.args.contains(&required.to_string()),
+                "missing {required}: {:?}",
+                claude.args
+            );
+        }
+        assert!(claude
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "dontAsk"]));
+        assert!(claude
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--settings", r#"{"sandbox":{"enabled":true}}"#]));
+        // 工具参数各只出现一次，且不得出现任何写入、执行、联网或绕过权限的工具/模式。
+        assert_eq!(
+            claude.args.iter().filter(|arg| arg.starts_with("--tools")).count(),
+            1
+        );
+        assert_eq!(
+            claude
+                .args
+                .iter()
+                .filter(|arg| arg.starts_with("--allowedTools"))
+                .count(),
+            1
+        );
+        for forbidden in [
+            "Bash",
+            "Edit",
+            "Write",
+            "WebFetch",
+            "WebSearch",
+            "bypassPermissions",
+            "--dangerously",
+            "--add-dir",
+        ] {
+            assert!(
+                !claude.args.iter().any(|arg| arg.contains(forbidden)),
+                "{forbidden} must never be granted: {:?}",
+                claude.args
+            );
+        }
+
+        // 与聊天参数逐项比对：只多 --restricted、只换两项工具参数，其余一项不少、顺序不变。
+        let chat = AgentService::chat_invocation(AgentKind::Claude, &workspace, "plan").unwrap();
+        let expected = chat
+            .args
+            .iter()
+            .flat_map(|arg| match arg.as_str() {
+                "--safe-mode" => vec!["--safe-mode".to_string(), "--restricted".to_string()],
+                "--tools=" => vec!["--tools=Read,Grep,Glob".to_string()],
+                "--allowedTools=" => vec!["--allowedTools=Read Grep Glob".to_string()],
+                other => vec![other.to_string()],
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(claude.args, expected);
+        assert_eq!((claude.cwd.clone(), claude.stdin.clone()), (chat.cwd.clone(), chat.stdin.clone()));
+
+        // 聊天仍然不带任何工具，也不依赖新加的 --restricted。
+        assert!(chat.args.contains(&"--tools=".to_string()));
+        assert!(chat.args.contains(&"--allowedTools=".to_string()));
+        assert!(!chat.args.contains(&"--restricted".to_string()));
+        assert!(!chat
+            .args
+            .iter()
+            .any(|arg| arg.contains("Read") || arg.contains("Grep") || arg.contains("Glob")));
+
+        // Codex：与聊天完全相同的只读沙箱一次性调用。
+        let codex =
+            AgentService::compile_read_only_invocation(AgentKind::Codex, &workspace, "plan")
+                .unwrap();
+        assert_eq!(
+            codex,
+            AgentService::chat_invocation(AgentKind::Codex, &workspace, "plan").unwrap()
+        );
+        assert!(codex.args.windows(2).any(|pair| pair == ["--sandbox", "read-only"]));
+        assert!(!codex.args.contains(&"workspace-write".to_string()));
+
+        // Openclaw/Hermes 没有经过验证的只读文件工具配置：拒绝，而不是悄悄给默认工具。
+        for kind in [AgentKind::Openclaw, AgentKind::Hermes] {
+            let error =
+                AgentService::compile_read_only_invocation(kind, &workspace, "plan").unwrap_err();
+            assert_eq!(error.code, "AGENT_OPERATION_PROTOCOL_UNSUPPORTED");
+        }
+
+        // 工作区校验与聊天一致：不含 wiki/ 的目录不能作为整理工作区。
+        let bare = std::env::temp_dir()
+            .join("llm-wiki-desktop")
+            .join(format!("compile-read-only-bare-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(AgentService::compile_read_only_invocation(AgentKind::Claude, &bare, "plan").is_err());
+
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // V8：后端每次启动前都按 CLI 的 --help 逐个核对参数。帮助里有 --restricted
+    // （claude 2.1.259 就有）才能运行整理只读调用；老版本没有时必须拒绝，
+    // 而不是悄悄去掉这层限制；聊天调用不依赖这个新参数，照常可用。
+    #[test]
+    fn compile_read_only_invocation_requires_restricted_in_cli_help() {
+        let help = "--print --output-format --verbose --permission-mode --settings --bare \
+            --safe-mode --restricted --disable-slash-commands --no-session-persistence --no-chrome \
+            --prompt-suggestions --strict-mcp-config --tools --allowedTools --json-schema";
+        let candidate_root = std::env::temp_dir().join("llm-wiki-desktop");
+        std::fs::create_dir_all(&candidate_root).unwrap();
+        let workspace = tempfile::tempdir_in(candidate_root).unwrap();
+        std::fs::create_dir_all(workspace.path().join("wiki")).unwrap();
+        let compile =
+            AgentService::compile_read_only_invocation(AgentKind::Claude, workspace.path(), "p")
+                .unwrap();
+        let chat = AgentService::chat_invocation(AgentKind::Claude, workspace.path(), "p").unwrap();
+        assert!(help_supports_operation(AgentKind::Claude, help, &compile));
+        let without_restricted = help.replace(" --restricted", "");
+        assert!(!help_supports_operation(
+            AgentKind::Claude,
+            &without_restricted,
+            &compile
+        ));
+        assert!(help_supports_operation(
+            AgentKind::Claude,
+            &without_restricted,
+            &chat
+        ));
     }
 
     #[test]

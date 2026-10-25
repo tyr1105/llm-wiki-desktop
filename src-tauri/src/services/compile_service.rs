@@ -378,13 +378,32 @@ impl CompileService {
                 // V8：规划提示按该 Agent 的 token 预算决定全量内联还是有界；超过硬上限在
                 // 这里就报 COMPILE_AGENT_INPUT_TOO_LARGE，不会启动命令行。
                 let planning = agent_plan::prompt(*agent, workspace, &language, policy)?;
-                // 记一行"走了哪条路、估算多少 token、预算多少"，便于试跑时核对（只有计数）。
+                // V8：有界规划的提示里没有页面正文，模型要用只读工具自己去读工作区里的页面，
+                // 所以只有这条路用只读整理调用（Claude：Read/Grep/Glob + --restricted）；
+                // 全量内联规划的上下文都在提示里，继续用不开任何工具的调用。
+                let read_only_files =
+                    matches!(planning.mode, agent_plan::PlanningMode::Bounded { .. });
+                // 记一行"走了哪条路、估算多少 token、预算多少、用哪套调用配置"，
+                // 便于试跑时核对（只有计数，不含正文）。
                 services
                     .task_service
-                    .append_log(task_id, LogLevel::Info, planning.log_line())
+                    .append_log(
+                        task_id,
+                        LogLevel::Info,
+                        format!(
+                            "{}; invocation profile: {}",
+                            planning.log_line(),
+                            if read_only_files {
+                                "read-only compile (file tools)"
+                            } else {
+                                "chat (complete context inline)"
+                            }
+                        ),
+                    )
                     .map_err(task_operation_error)?;
                 let plan_prompt = planning.text;
-                let invocation = AgentService::chat_invocation(*agent, workspace, &plan_prompt)?;
+                let invocation =
+                    compile_agent_invocation(*agent, workspace, &plan_prompt, read_only_files)?;
                 let raw_plan = services.agent_service.run_task_streaming_for_agent(
                     *agent,
                     &invocation,
@@ -418,7 +437,7 @@ impl CompileService {
                         &plan,
                         sources,
                         &dependencies,
-                        |invocation_workspace, prompt, lane| {
+                        |invocation_workspace, prompt, lane, call| {
                             if services.task_service.is_cancelled(task_id) {
                                 return Err(BackendError::new(
                                     "AGENT_CANCELLED",
@@ -427,11 +446,31 @@ impl CompileService {
                                     false,
                                 ));
                             }
+                            // V8：记一行"这一页的上下文怎么给的、初始输入估算多少 token"
+                            // （只有计数，不含正文），便于试跑时核对分层是否生效。
+                            services
+                                .task_service
+                                .append_log(
+                                    task_id,
+                                    LogLevel::Info,
+                                    format!(
+                                        "Page input for {}: {}; ~{} tokens (UTF-8 bytes / 2)",
+                                        call.target,
+                                        call.transport.describe(),
+                                        agent_budget::estimate_tokens(prompt),
+                                    ),
+                                )
+                                .map_err(task_operation_error)?;
+                            // 发出前按该 Agent 的预算核一次：超过硬上限就在启动命令行之前报
+                            // COMPILE_AGENT_INPUT_TOO_LARGE，不浪费一次调用。
                             agent_plan::validate_input(*agent, prompt)?;
-                            let invocation = AgentService::chat_invocation(
+                            // 内联生成（全部上下文都在提示里）继续不开任何工具；只有文件模式
+                            // （上下文在租约目录的 generation-request.md 里）才开只读工具。
+                            let invocation = compile_agent_invocation(
                                 *agent,
                                 invocation_workspace,
                                 prompt,
+                                call.transport.needs_read_only_tools(),
                             )?;
                             services
                                 .agent_service
@@ -462,7 +501,9 @@ impl CompileService {
                         policy,
                     )?;
                     agent_plan::validate_input(*agent, &prompt)?;
-                    let invocation = AgentService::chat_invocation(*agent, workspace, &prompt)?;
+                    // Legacy 清单提示是全量内联的，继续用不开任何工具的调用。
+                    let invocation =
+                        compile_agent_invocation(*agent, workspace, &prompt, false)?;
                     let raw = services.agent_service.run_task_streaming_for_agent(
                         *agent,
                         &invocation,
@@ -3505,6 +3546,26 @@ fn strip_historical_log_from_affected_pages(plan: &mut CompilePlan) -> usize {
     removed
 }
 
+/// V8：按"这次调用要不要自己读文件"选择 Agent 调用配置。
+///
+/// * `read_only_files = true`：有界规划、逐页生成的文件模式。提示里只有部分上下文，
+///   其余在工作区/租约目录的文件里，必须开只读工具（Claude：Read/Grep/Glob +
+///   --restricted；Codex：只读沙箱，与原来相同）。
+/// * `read_only_files = false`：全部上下文都已内联（全量规划、内联生成、Legacy 清单），
+///   继续用不开任何工具的 `chat_invocation`，避免模型主动去读 log.md 这类大文件。
+fn compile_agent_invocation(
+    agent: AgentKind,
+    workspace: &Path,
+    prompt: &str,
+    read_only_files: bool,
+) -> Result<crate::services::AgentInvocation, BackendError> {
+    if read_only_files {
+        AgentService::compile_read_only_invocation(agent, workspace, prompt)
+    } else {
+        AgentService::chat_invocation(agent, workspace, prompt)
+    }
+}
+
 fn is_known_page_type(raw: &str) -> bool {
     matches!(
         raw,
@@ -5662,5 +5723,56 @@ mod tests {
         assert!(manifest.contains("HISTORICAL_LOG_BODY"));
         let legacy = CompileService::provider_prompt(root.path(), "en").unwrap();
         assert!(legacy.contains("HISTORICAL_LOG_BODY"));
+    }
+
+    // V8：整理调用只在"要自己读文件"时才开只读工具。内联生成、全量规划、Legacy 清单
+    // 与聊天调用完全相同、不带任何工具；有界规划和逐页文件模式才用
+    // Read/Grep/Glob + --restricted 的只读整理调用。
+    #[test]
+    fn compile_invocations_open_read_only_tools_only_for_file_modes() {
+        let workspace = std::env::temp_dir()
+            .join("llm-wiki-desktop")
+            .join(format!("compile-invocation-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(workspace.join("wiki")).unwrap();
+        let chat = AgentService::chat_invocation(AgentKind::Claude, &workspace, "p").unwrap();
+        // 内联生成：不开工具。
+        assert!(!agent_pages::PageTransportKind::Inline.needs_read_only_tools());
+        let inline = compile_agent_invocation(
+            AgentKind::Claude,
+            &workspace,
+            "p",
+            agent_pages::PageTransportKind::Inline.needs_read_only_tools(),
+        )
+        .unwrap();
+        assert_eq!(inline, chat, "inline generation must keep the tool-disabled chat profile");
+        assert!(inline.args.contains(&"--tools=".to_string()));
+        assert!(!inline.args.contains(&"--restricted".to_string()));
+        // 文件模式（分层、整体）：只开 Read/Grep/Glob，并带 --restricted。
+        for transport in [
+            agent_pages::PageTransportKind::Layered,
+            agent_pages::PageTransportKind::WholeFile,
+        ] {
+            assert!(transport.needs_read_only_tools());
+            let file_mode = compile_agent_invocation(
+                AgentKind::Claude,
+                &workspace,
+                "p",
+                transport.needs_read_only_tools(),
+            )
+            .unwrap();
+            assert!(file_mode.args.contains(&"--tools=Read,Grep,Glob".to_string()));
+            assert!(file_mode.args.contains(&"--allowedTools=Read Grep Glob".to_string()));
+            assert!(file_mode.args.contains(&"--restricted".to_string()));
+            assert!(!file_mode.args.iter().any(|arg| arg.contains("Bash")
+                || arg.contains("Edit")
+                || arg.contains("Write")
+                || arg.contains("WebFetch")));
+        }
+        // Codex 两种情况都是同一个只读沙箱调用，行为与 V7 相同。
+        assert_eq!(
+            compile_agent_invocation(AgentKind::Codex, &workspace, "p", true).unwrap(),
+            compile_agent_invocation(AgentKind::Codex, &workspace, "p", false).unwrap()
+        );
+        let _ = fs::remove_dir_all(&workspace);
     }
 }

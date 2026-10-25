@@ -83,8 +83,9 @@ impl ProcessRunner for FakeAgentRunner {
         Ok(if args == ["--version"] {
             "1.0.0".into()
         } else {
+            // V8：真实 claude 的 --help 含 --restricted（Claude 只读整理调用要用）。
             "--print --output-format --verbose --permission-mode --settings --bare \
-             --safe-mode --disable-slash-commands --no-session-persistence --no-chrome \
+             --safe-mode --restricted --disable-slash-commands --no-session-persistence --no-chrome \
              --prompt-suggestions --strict-mcp-config --tools --allowedTools --json-schema"
                 .into()
         })
