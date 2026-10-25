@@ -341,9 +341,15 @@ mod tests {
     fn oversized_fixed_context_is_reported_separately_from_sources() {
         let root = workspace_fixture(&large_page(), &history());
         let w = root.path();
-        // schema 本身约 70 万字节（35 万 token），超过 Claude 默认 10 万 token 的硬上限：
-        // 拆分来源也没用，原因必须写成 fixed_context。
+        // schema 本身约 65 万字节（约 32.5 万 token）。用 20 万窗口（硬上限 10 万 token）的
+        // Claude 验证：拆分来源也没用，原因必须写成 fixed_context。
         std::fs::write(w.join("schema.md"), "# Schema\n".to_string() + &"规则说明\n".repeat(50_000)).unwrap();
+        let narrow = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, Some("claude=200000"));
+        let error = prompt_with_budget(narrow, w, "zh-CN", POLICY).unwrap_err();
+        assert_eq!(error.code, "COMPILE_AGENT_INPUT_TOO_LARGE");
+        assert_eq!(error.details.unwrap()["reason"], "fixed_context");
+        // 默认窗口（100 万，硬上限 50 万 token）同样适用：schema 再大一些（约 130 万字节）就超。
+        std::fs::write(w.join("schema.md"), "# Schema\n".to_string() + &"规则说明\n".repeat(100_000)).unwrap();
         let error = prompt(AgentKind::Claude, w, "zh-CN", POLICY).unwrap_err();
         assert_eq!(error.code, "COMPILE_AGENT_INPUT_TOO_LARGE");
         assert_eq!(error.details.unwrap()["reason"], "fixed_context");
@@ -393,7 +399,7 @@ mod tests {
     fn environment_override_changes_the_planning_decision() {
         let root = workspace_fixture(&large_page(), &history());
         let full = CompileService::provider_plan_prompt_with_policy(root.path(), "zh-CN", POLICY).unwrap();
-        // 默认 200,000 窗口：大知识库走有界。
+        // 默认窗口（opus 别名实测的 100 万，内联阈值 20 万 token）：约 165 万字节的大知识库走有界。
         let default = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, None);
         assert!(matches!(prompt_with_budget(default, root.path(), "zh-CN", POLICY).unwrap().mode, PlanningMode::Bounded { .. }));
         // 用环境变量把 Claude 窗口调到 1000 万：内联阈值 200 万 token，同一份全量就能直接内联。
@@ -415,7 +421,10 @@ mod tests {
         for index in 0..500 {
             std::fs::write(w.join(format!("wiki/concepts/页面-{index:04}.md")), format!("# 页面 {index}\n{}", "正文".repeat(60))).unwrap();
         }
-        let planning = prompt(AgentKind::Claude, w, "zh-CN", POLICY).unwrap();
+        // 全量提示约 20 万字节：用 20 万窗口（内联阈值 4 万 token）的 Claude 触发有界规划，
+        // 验证"清单超过 64KB 就写成文件"。默认 100 万窗口下这么小的库会直接全量内联。
+        let narrow = || AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, Some("claude=200000"));
+        let planning = prompt_with_budget(narrow(), w, "zh-CN", POLICY).unwrap();
         assert_eq!(planning.mode, PlanningMode::Bounded { inventory_in_file: true });
         assert!(planning.text.contains(WORKSPACE_WIKI_INVENTORY));
         assert!(!planning.text.contains("wiki/concepts/页面-0001.md"), "a large inventory must not be embedded");
@@ -431,15 +440,15 @@ mod tests {
         for index in 10..500 {
             std::fs::remove_file(w.join(format!("wiki/concepts/页面-{index:04}.md"))).unwrap();
         }
-        assert_eq!(prompt(AgentKind::Claude, w, "zh-CN", POLICY).unwrap().mode, PlanningMode::FullInline);
+        assert_eq!(prompt_with_budget(narrow(), w, "zh-CN", POLICY).unwrap().mode, PlanningMode::FullInline);
         assert!(!w.join(WORKSPACE_WIKI_INVENTORY).exists());
     }
 
     #[test]
     fn validate_input_applies_each_agents_budget() {
-        // Claude 现在也做预检：默认硬上限 100,000 token = 200,000 字节。
-        validate_input(AgentKind::Claude, &"a".repeat(200_000)).unwrap();
-        assert_eq!(validate_input(AgentKind::Claude, &"a".repeat(200_001)).unwrap_err().code, "COMPILE_AGENT_INPUT_TOO_LARGE");
+        // Claude 现在也做预检：默认硬上限 500,000 token = 1,000,000 字节。
+        validate_input(AgentKind::Claude, &"a".repeat(1_000_000)).unwrap();
+        assert_eq!(validate_input(AgentKind::Claude, &"a".repeat(1_000_001)).unwrap_err().code, "COMPILE_AGENT_INPUT_TOO_LARGE");
         // Codex 的 token 预算（默认 250,000 token）和 CLI 字符上限都要检查。
         let error = validate_input(AgentKind::Codex, &"中".repeat(200_000)).unwrap_err();
         assert_eq!(error.code, "COMPILE_AGENT_INPUT_TOO_LARGE");

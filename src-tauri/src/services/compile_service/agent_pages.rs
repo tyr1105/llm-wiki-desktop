@@ -19,27 +19,80 @@
 //!     应用成功时与 CompileRecord 同一个文件事务写到 `.app/.../compile-audit/<任务编号>.json`；
 //!     log.md 只追加标题 + 3 行人能读的摘要（时间、任务编号、所选来源路径、受影响页面、
 //!     审计文件路径）。
-//!   * index.md / overview.md 的候选相对原文增长超过上限（默认每批 4000 字符）就拒绝，
+//!   * index.md / overview.md 的候选体积有两道硬闸门（见 `StructuralPagePolicy`），超过就
 //!     报 COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED，绝不静默截断；提示词也改成
-//!     "就地更新导航、不追加逐批叙述、不删任何已有 raw/sources/... 引用"。
+//!     "就地更新导航、不追加逐批叙述、不删任何已有 raw/sources/... 引用"，并写明本批
+//!     这一页最多能有多少字符。
+//!     1. 每批增量：基数 4000 字符，本批每多选 1 条来源再加 1000（封顶 32000）；候选整页
+//!        不超过 16000 字符的小页（新知识库、起始模板）不查增量；全量重编不查增量。
+//!     2. 绝对体积上限：index 12 万、overview 6 万字符（默认开启）。原文超过上限后，每批
+//!        只能给每个新派生页加一行导航、给每条本批新引用的来源加一条引用，不能再涨别的。
+//!        开启顺序：第二期瘦身已把真实知识库的 index/overview 降到约 10.2 万 / 4.7 万字符，
+//!        低于默认上限；没瘦身的库原文超过上限时会直接进入"只能加导航行"的状态。
 use super::*;
 use super::agent_budget::{self, AgentInputBudget, OversizeReason};
 
-/// 结构页（index.md、overview.md）每批允许增长的默认上限（Unicode 字符数）。
+/// 结构页（index.md、overview.md）每批允许增长的基数（Unicode 字符数），也就是本批只选了
+/// 1 条来源时的增量上限。
 ///
-/// 为什么是 4000：最近 33 批实测平均每批 index +1,681、overview +1,395 字符，正常的
-/// "新增几页导航、改几句现状"远低于 4000；而 V7 时期每批追加整段"本轮/历史阶段"叙述
-/// 的做法会超过它。这是硬闸门：超过就拒绝候选，不截断。
+/// 为什么是 4000：最近 33 批实测平均每批 index +1,681、overview +1,395 字符；按来源数
+/// 分组统计 135 次真实整理，单来源的 55 批没有一批超过 4000。V7 时期每批追加整段
+/// "本轮/历史阶段"叙述的做法会超过它。
 pub(super) const DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS: usize = 4_000;
 
-/// 覆盖结构页增长上限的环境变量（正整数，单位：字符），由启动后端的脚本传给后端
+/// 本批每多选 1 条来源，增量上限再加多少字符。
+///
+/// 为什么要按来源数放宽（评审确认的问题）：固定 4000 会误伤正常的多来源批次——真实
+/// 快照里 4 条来源的批次 p90 增长 4,809、最大 5,461，5 条来源 p90 5,274、最大 5,894，
+/// 固定 4000 会拒掉其中三四成。每条来源通常意味着一条新的 frontmatter 引用和一两处
+/// 导航改动，按 1000 放宽后，4 条来源上限 7000、5 条 8000，历史批次全部放得下。
+const STRUCTURAL_GROWTH_CHARS_PER_EXTRA_SOURCE: usize = 1_000;
+
+/// 按来源数放宽后的增量上限封顶：再大的批次，一批也最多涨这么多（全量重编除外）。
+const MAX_STRUCTURAL_BATCH_GROWTH_CHARS: usize = 32_000;
+
+/// 小页豁免：候选整页不超过这么多字符时，不查每批增量。
+///
+/// 为什么（评审确认的问题）：新建或很小的知识库里 index/overview 只有约 170 字的起始
+/// 模板（或者还不存在），首批来源一多，写一份几千字的全局概述或逐页导航是正常行为，
+/// 不能因为"增量超过 4000"就整份拒绝。16000 字符对任何 Agent 的预算都可以忽略不计，
+/// 而增量闸门要防的是十几万字级别的页面继续膨胀，两者不冲突。
+const STRUCTURAL_SMALL_PAGE_FREE_CHARS: usize = 16_000;
+
+/// index.md 的默认绝对体积上限（字符）。
+///
+/// 为什么是 12 万：第二期瘦身后真实 index 约 10.2 万字符（20.5 万字节），留约 1.8 万
+/// 字符余量；12 万字符约 25 万字节、约 12.5 万 token（字节 ÷2），远低于 Claude、Codex
+/// 默认硬上限，保证这一页的基线永远能内联在提示里（PageEdits 锚点不靠读文件）。
+pub(super) const DEFAULT_INDEX_SIZE_CAP_CHARS: usize = 120_000;
+
+/// overview.md 的默认绝对体积上限（字符）。瘦身后真实 overview 约 4.7 万字符，留约
+/// 1.3 万余量；overview 只写全局现状，不需要随页面数线性增长。
+pub(super) const DEFAULT_OVERVIEW_SIZE_CAP_CHARS: usize = 60_000;
+
+/// 原文超过体积上限后，每个新派生页允许增加的字符数：够写一行简短导航（链接 + 一句范围说明）。
+/// index 必须直接链接每个派生页（IndexDrift 健康检查），所以新页的导航行不能不给。
+const OVER_CAP_CHARS_PER_NEW_PAGE: usize = 400;
+
+/// 原文超过体积上限后，每条本批新引用的来源允许增加的字符数：够写一条 frontmatter
+/// `sources` 引用（真实 index 平均每条约 50 字符）。已经被引用过的来源不再给额度。
+const OVER_CAP_CHARS_PER_NEW_CITATION: usize = 80;
+
+/// 覆盖结构页增量基数的环境变量（正整数，单位：字符），由启动后端的脚本传给后端
 /// 进程本身。例如某一批确实需要大幅改写导航时，运维可以临时调大，不必重新编译。
 pub(super) const STRUCTURAL_PAGE_GROWTH_ENV: &str = "LLM_WIKI_STRUCTURAL_PAGE_GROWTH_CHARS";
+
+/// 覆盖结构页绝对体积上限的环境变量，格式如 `index=120000,overview=60000`；
+/// 某一页写 `off`（或整个值写 `off`）表示关闭该页的绝对上限。写错的条目忽略，回退默认值。
+pub(super) const STRUCTURAL_PAGE_SIZE_CAPS_ENV: &str = "LLM_WIKI_STRUCTURAL_PAGE_SIZE_CAPS";
 
 /// 环境变量允许的范围；超出范围视为写错，忽略并回退默认值（防止误写成 0 让每批都失败，
 /// 或多写几个 0 等于关掉闸门）。
 const MIN_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS: usize = 500;
 const MAX_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS: usize = 200_000;
+/// 绝对体积上限不能低于小页豁免线（否则小页豁免会和上限互相打架），也不能大到失去意义。
+const MIN_STRUCTURAL_PAGE_SIZE_CAP_CHARS: usize = STRUCTURAL_SMALL_PAGE_FREE_CHARS;
+const MAX_STRUCTURAL_PAGE_SIZE_CAP_CHARS: usize = 5_000_000;
 
 /// 完整审计文件的大小上限。它不再进入 wiki/log.md，也不会进任何提示词，所以比 V7
 /// 给日志条目的 80KB 宽松；仍然设上限，防止异常大的依赖清单无界写盘。
@@ -64,17 +117,17 @@ pub(super) struct CandidateAuditTarget {
     pub(super) audit_path: String,
 }
 
-/// V8：逐页生成里和"候选审计记录""结构页增长闸门"有关的设置。
+/// V8：逐页生成里和"候选审计记录""结构页体积闸门"有关的设置。
 #[derive(Debug, Clone)]
 pub(super) struct CandidateGenerationOptions {
     pub(super) audit: CandidateAuditTarget,
-    /// index.md / overview.md 每批最多允许增长多少字符（Unicode 标量个数）。
-    pub(super) structural_growth_limit_chars: usize,
+    /// index.md / overview.md 的体积规则（每批增量 + 绝对上限）。
+    pub(super) structural: StructuralPagePolicy,
 }
 
 impl CandidateGenerationOptions {
     /// 测试入口用的固定设置：固定任务编号和时间（保证串行/并行两次生成逐字节相同），
-    /// 增长上限用默认常量（不读环境变量，测试结果稳定）。
+    /// 结构页规则用默认常量（不读环境变量，测试结果稳定）。
     fn for_tests() -> Self {
         Self {
             audit: CandidateAuditTarget {
@@ -82,17 +135,80 @@ impl CandidateGenerationOptions {
                 generated_at: "2026-01-01T00:00:00Z".into(),
                 audit_path: ".app/compile-audit/test-compile-task.json".into(),
             },
-            structural_growth_limit_chars: DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS,
+            structural: StructuralPagePolicy::defaults(false),
         }
     }
 }
 
-/// 读取结构页增长上限：环境变量是合法范围内的正整数就用它，否则用默认值。
-pub(super) fn structural_growth_limit_from_env() -> usize {
-    parse_structural_growth_limit(std::env::var(STRUCTURAL_PAGE_GROWTH_ENV).ok().as_deref())
+/// V8：index.md / overview.md 候选的体积规则（规则见文件头）。
+///
+/// 为什么既要"每批增量"又要"绝对上限"：只限增量时，每批都卡在上限以内就能一直合法地
+/// 累积，页面仍会线性膨胀（评审确认的问题）；只限绝对体积时，新知识库首批或正常的多
+/// 来源批次又不该受影响。两者合起来：小页自由、批次按来源数放宽、大页只能加导航行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StructuralPagePolicy {
+    /// 每批增量的基数（本批 1 条来源时的上限），默认 4000，可用环境变量覆盖。
+    pub(super) base_growth_chars: usize,
+    /// 全量重编（FullRecompile）：本来就是对整个知识库的广义重写，不查每批增量，
+    /// 只查绝对上限。
+    pub(super) full_recompile: bool,
+    /// index.md 的绝对体积上限；None 表示关闭。
+    pub(super) index_size_cap_chars: Option<usize>,
+    /// overview.md 的绝对体积上限；None 表示关闭。
+    pub(super) overview_size_cap_chars: Option<usize>,
 }
 
-/// 解析环境变量的值（拆出来方便测试）：空、非数字或超出范围都回退默认值。
+impl StructuralPagePolicy {
+    /// 生产入口：默认值 + 后端进程环境变量的覆盖。`full_recompile` 由 Update Wiki 的
+    /// 模式决定（调用方传入）。
+    pub(super) fn from_env(full_recompile: bool) -> Self {
+        let (index_size_cap_chars, overview_size_cap_chars) = parse_structural_size_caps(
+            std::env::var(STRUCTURAL_PAGE_SIZE_CAPS_ENV).ok().as_deref(),
+        );
+        Self {
+            base_growth_chars: parse_structural_growth_limit(
+                std::env::var(STRUCTURAL_PAGE_GROWTH_ENV).ok().as_deref(),
+            ),
+            full_recompile,
+            index_size_cap_chars,
+            overview_size_cap_chars,
+        }
+    }
+
+    /// 纯默认值（不读环境变量），测试和文档用。
+    pub(super) fn defaults(full_recompile: bool) -> Self {
+        Self {
+            base_growth_chars: DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS,
+            full_recompile,
+            index_size_cap_chars: Some(DEFAULT_INDEX_SIZE_CAP_CHARS),
+            overview_size_cap_chars: Some(DEFAULT_OVERVIEW_SIZE_CAP_CHARS),
+        }
+    }
+
+    /// 某一页的绝对上限；不是 index/overview 时没有。
+    fn size_cap(&self, target: &str) -> Option<usize> {
+        match target {
+            "wiki/index.md" => self.index_size_cap_chars,
+            "wiki/overview.md" => self.overview_size_cap_chars,
+            _ => None,
+        }
+    }
+
+    /// 本批的增量上限：基数 + 每多 1 条来源加 1000，封顶 32000（基数本身被调得更大时
+    /// 以基数为准）；全量重编不设增量上限。
+    fn batch_growth_limit(&self, selected_source_count: usize) -> Option<usize> {
+        if self.full_recompile {
+            return None;
+        }
+        let scaled = self.base_growth_chars.saturating_add(
+            STRUCTURAL_GROWTH_CHARS_PER_EXTRA_SOURCE
+                .saturating_mul(selected_source_count.saturating_sub(1)),
+        );
+        Some(scaled.min(MAX_STRUCTURAL_BATCH_GROWTH_CHARS.max(self.base_growth_chars)))
+    }
+}
+
+/// 解析增量基数的环境变量（拆出来方便测试）：空、非数字或超出范围都回退默认值。
 fn parse_structural_growth_limit(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| {
@@ -100,6 +216,162 @@ fn parse_structural_growth_limit(raw: Option<&str>) -> usize {
                 .contains(value)
         })
         .unwrap_or(DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS)
+}
+
+/// 解析绝对体积上限的环境变量，返回 (index 上限, overview 上限)。
+///
+/// 规则：逗号分隔的 `page=chars`，page 是 index 或 overview（不区分大小写）；chars 允许
+/// 下划线（120_000）；写 `off` 表示关闭这一页的上限；整个值写 `off` 两页都关闭。
+/// 写错的条目（名字不认识、不是数字、超出合理范围）直接忽略，该页保持默认值。
+fn parse_structural_size_caps(raw: Option<&str>) -> (Option<usize>, Option<usize>) {
+    let mut index = Some(DEFAULT_INDEX_SIZE_CAP_CHARS);
+    let mut overview = Some(DEFAULT_OVERVIEW_SIZE_CAP_CHARS);
+    let Some(raw) = raw else {
+        return (index, overview);
+    };
+    if raw.trim().eq_ignore_ascii_case("off") {
+        return (None, None);
+    }
+    for entry in raw.split(',') {
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        // Some(None) = 明确关闭；Some(Some(n)) = 合法的上限；None = 写错，忽略。
+        let parsed = if value.eq_ignore_ascii_case("off") {
+            Some(None)
+        } else {
+            value
+                .replace('_', "")
+                .parse::<usize>()
+                .ok()
+                .filter(|chars| {
+                    (MIN_STRUCTURAL_PAGE_SIZE_CAP_CHARS..=MAX_STRUCTURAL_PAGE_SIZE_CAP_CHARS)
+                        .contains(chars)
+                })
+                .map(Some)
+        };
+        let Some(parsed) = parsed else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "index" => index = parsed,
+            "overview" => overview = parsed,
+            _ => {}
+        }
+    }
+    (index, overview)
+}
+
+/// 是哪一道闸门决定了本批的最大字符数（写进错误详情，方便重试脚本决定要不要拆组）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuralRule {
+    /// 每批增量上限（按本批来源数放宽）：拆成更小的来源组通常有用。
+    BatchGrowth,
+    /// 绝对体积上限：只能加导航行和新引用，拆组没用，要么就地精简，要么先瘦身。
+    SizeCap,
+}
+
+impl StructuralRule {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BatchGrowth => "per_batch_growth",
+            Self::SizeCap => "size_cap",
+        }
+    }
+}
+
+/// 某一结构页本批的体积额度。提示词和闸门用同一个函数算出来，保证模型看到的上限
+/// 就是后端检查的上限。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuralAllowance {
+    /// 原文字符数（候选工作区里的这一页，也就是 PageEdits 所对的基线；不存在按 0）。
+    baseline_chars: usize,
+    /// 本批候选整页最多允许的字符数；None 表示不限（全量重编且关闭了绝对上限）。
+    max_candidate_chars: Option<usize>,
+    /// 决定 max_candidate_chars 的那道闸门。
+    binding_rule: Option<StructuralRule>,
+    /// 本批的增量上限（全量重编为 None）。
+    batch_growth_limit_chars: Option<usize>,
+    /// 这一页的绝对上限（关闭为 None）。
+    size_cap_chars: Option<usize>,
+    /// 超过绝对上限后本批还能加的字符数（新派生页导航行 + 新来源引用）。
+    over_cap_allowance_chars: usize,
+    selected_source_count: usize,
+    newly_cited_source_count: usize,
+    new_derived_page_count: usize,
+}
+
+/// 算出 index/overview 本批的体积额度；其他页面返回 None（不受结构页闸门约束）。
+///
+/// * 本批所选来源数：去重后的所选来源条数（全量重编时是全部来源）。
+/// * 本批新引用的来源：原文里还没出现过其路径的所选来源。
+/// * 新派生页：本批已生成、但候选工作区里原本不存在的非结构页。
+fn structural_allowance(
+    policy: &StructuralPagePolicy,
+    workspace: &Path,
+    target: &str,
+    sources: &[ResolvedCompileSource],
+    generated: &[CompileFile],
+) -> Result<Option<StructuralAllowance>, BackendError> {
+    if !matches!(target, "wiki/index.md" | "wiki/overview.md") {
+        return Ok(None);
+    }
+    let baseline = read_markdown(workspace, target, false)?.unwrap_or_default();
+    let baseline_chars = baseline.chars().count();
+    let mut unique_sources = HashSet::new();
+    let mut newly_cited_source_count = 0;
+    for source in sources {
+        if unique_sources.insert(source.workspace_path.as_str())
+            && !baseline.contains(source.workspace_path.as_str())
+            && !baseline.contains(source.project_path.as_str())
+        {
+            newly_cited_source_count += 1;
+        }
+    }
+    let selected_source_count = unique_sources.len();
+    // 生成的页面路径在 generate_with_executor 里已经按安全的 wiki Markdown 路径校验过，
+    // 这里只看候选工作区里原来有没有这个文件：只有"确实不存在"才算新页（符号链接、
+    // 读不到元数据等情况都按"已存在"算，不多给额度，偏保守）。
+    let new_derived_page_count = generated
+        .iter()
+        .filter(|file| !is_structural_page(&file.path))
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|path| {
+            std::fs::symlink_metadata(workspace.join(path))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+        .count();
+    let batch_growth_limit_chars = policy.batch_growth_limit(selected_source_count);
+    // 增量闸门：原文 + 本批增量上限；小页豁免让整页不超过 16000 字符的候选总能通过。
+    let batch_ceiling = batch_growth_limit_chars
+        .map(|limit| (baseline_chars + limit).max(STRUCTURAL_SMALL_PAGE_FREE_CHARS));
+    // 绝对上限：页面最多长到上限；原文已经超过上限时以原文为准（不要求一次性缩回去），
+    // 在此之上只能加新派生页的导航行和新来源的引用。
+    let size_cap_chars = policy.size_cap(target);
+    let over_cap_allowance_chars = OVER_CAP_CHARS_PER_NEW_PAGE * new_derived_page_count
+        + OVER_CAP_CHARS_PER_NEW_CITATION * newly_cited_source_count;
+    let cap_ceiling =
+        size_cap_chars.map(|cap| cap.max(baseline_chars) + over_cap_allowance_chars);
+    let (max_candidate_chars, binding_rule) = match (batch_ceiling, cap_ceiling) {
+        (Some(batch), Some(cap)) if cap <= batch => (Some(cap), Some(StructuralRule::SizeCap)),
+        (Some(batch), _) => (Some(batch), Some(StructuralRule::BatchGrowth)),
+        (None, Some(cap)) => (Some(cap), Some(StructuralRule::SizeCap)),
+        (None, None) => (None, None),
+    };
+    Ok(Some(StructuralAllowance {
+        baseline_chars,
+        max_candidate_chars,
+        binding_rule,
+        batch_growth_limit_chars,
+        size_cap_chars,
+        over_cap_allowance_chars,
+        selected_source_count,
+        newly_cited_source_count,
+        new_derived_page_count,
+    }))
 }
 
 /// V8：逐页生成的结果——候选清单，加上 log.md 摘要所指向的完整审计记录。
@@ -150,6 +422,13 @@ impl PageTransportKind {
 pub(super) struct PageCall<'a> {
     pub(super) target: &'a str,
     pub(super) transport: PageTransportKind,
+    /// 只在"整体文件模式 + 目标页走 PageEdits（基线超过 32KB）"时有值：基线字节数。
+    ///
+    /// 为什么要单独标出来（评审确认的问题）：这种情况下目标页基线不在提示里，PageEdits
+    /// 的锚点要靠模型用 Read 从 generation-request.md 读回来；长行会不会被截断还没实测，
+    /// 截断就会以 "Page edit anchor is absent" 失败。调用方据此在任务日志里写一条警告，
+    /// 提示检查 LLM_WIKI_AGENT_CONTEXT_TOKENS 是不是把窗口设得比模型实际的小。
+    pub(super) page_edits_baseline_in_file: Option<usize>,
 }
 
 /// 串行入口（只在测试里用）：总是把完整内联提示交给 `complete`，与 V7 相同，
@@ -378,6 +657,8 @@ struct FileModeRequest {
     transport: PageTransportKind,
     prompt: String,
     context: String,
+    /// 目标页的 PageEdits 基线被挪进了文件（只有整体文件模式会这样）时的基线字节数。
+    page_edits_baseline_in_file: Option<usize>,
 }
 
 // Read-only context is kept complete in a private per-call lease, including
@@ -395,7 +676,11 @@ fn complete_page_request(
             workspace,
             &request.prompt,
             lane,
-            PageCall { target: &request.target, transport: PageTransportKind::Inline },
+            PageCall {
+                target: &request.target,
+                transport: PageTransportKind::Inline,
+                page_edits_baseline_in_file: None,
+            },
         );
     };
     // 兜底：文件模式要求模型自己读 generation-request.md，只有具备只读文件工具的 Agent
@@ -447,7 +732,11 @@ fn complete_page_request(
         lease.path(),
         &file_mode.prompt,
         lane,
-        PageCall { target: &request.target, transport: file_mode.transport },
+        PageCall {
+            target: &request.target,
+            transport: file_mode.transport,
+            page_edits_baseline_in_file: file_mode.page_edits_baseline_in_file,
+        },
     );
     let after = std::fs::read(&file).map_err(|e| io_error("COMPILE_INPUT_READ_FAILED", e, &file))?;
     if hash_bytes(&after) != hash {
@@ -493,7 +782,7 @@ fn fits_hard_limit(budget: &AgentInputBudget, text: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn page_request(
     budget: &AgentInputBudget,
-    structural_growth_limit_chars: usize,
+    structural: &StructuralPagePolicy,
     workspace: &Path,
     language: &str,
     plan: &CompilePlan,
@@ -506,7 +795,7 @@ fn page_request(
     let build = |mode: PageContextMode| {
         page_prompt_parts(
             workspace, language, plan, target, sources, dependencies, generated, deletions, mode,
-            structural_growth_limit_chars,
+            structural,
         )
     };
     // 完整内联提示（与 V7 逐字节相同）。
@@ -538,13 +827,18 @@ fn page_request(
                     transport: PageTransportKind::Layered,
                     prompt: file_prompt,
                     context: layered.reference,
+                    page_edits_baseline_in_file: None,
                 }),
             });
         }
     }
     // 3. 必需的内联部分本身超过硬上限：整份上下文写进文件，提示里只给路径和哈希。
-    //    （这样目标页基线也要靠模型读文件，是最后的退路。）
+    //    （这样目标页基线也要靠模型读文件，是最后的退路。）按默认窗口（Claude 为 opus
+    //    别名实测的 100 万）和结构页绝对上限，正常规模的知识库走不到这里；真走到这里且
+    //    目标页走 PageEdits 时，把基线字节数标出来，调用方在任务日志里写警告。
     let context = build(PageContextMode::WholeFile)?.inline;
+    let page_edits_baseline_in_file =
+        large_page_baseline(workspace, target)?.map(|baseline| baseline.len());
     Ok(PageRequest {
         target: target.to_string(),
         prompt,
@@ -552,6 +846,7 @@ fn page_request(
             transport: PageTransportKind::WholeFile,
             prompt: whole_file_prompt(target, &context),
             context,
+            page_edits_baseline_in_file,
         }),
     })
 }
@@ -621,7 +916,7 @@ fn generate_with_executor(
                 // V8：按该 Agent 的预算决定内联、分层还是整体文件模式
                 // （V7 这里不管实际用哪个 Agent，都按 Codex 的字符上限判断）。
                 page_request(
-                    budget, options.structural_growth_limit_chars, workspace, language, plan, target,
+                    budget, &options.structural, workspace, language, plan, target,
                     sources, dependencies, &files, &deletions,
                 )
             })
@@ -657,14 +952,18 @@ fn generate_with_executor(
             {
                 return Err(invalid("A scaffold response cannot introduce new deletions after navigation generation begins."));
             }
-            // V8 硬闸门：index.md / overview.md 的候选相对原文增长超过上限就拒绝整份候选
-            // （不截断、不改写模型输出）。在这里检查而不是等全部页面生成完：越早失败，
-            // 越少浪费后续的 Agent 调用。
+            // V8 硬闸门：index.md / overview.md 的候选超过本批体积额度就拒绝整份候选
+            // （不截断、不改写模型输出）。额度和提示词里告诉模型的是同一个数：同样按
+            // 本批所选来源和此前已生成的派生页（`files`，此时还不含本页）计算。
+            // 结构页排在最后生成（它们要给新派生页加导航），所以被拒时派生页的调用已经
+            // 花掉了——这正是额度要按批次规模放宽、错误详情要带 selectedSourceCount 的原因。
             check_structural_page_growth(
+                &options.structural,
                 workspace,
                 target,
                 &fragment.files[0].content,
-                options.structural_growth_limit_chars,
+                sources,
+                &files,
             )?;
             deletions.extend(fragment.deletions);
             files.extend(fragment.files);
@@ -685,48 +984,72 @@ fn generate_with_executor(
     Ok(GeneratedPages { manifest, audit })
 }
 
-/// V8 结构页增长硬闸门。
+/// V8 结构页体积硬闸门。
 ///
-/// 做什么：只对 wiki/index.md、wiki/overview.md 生效。增长量 = 候选字符数 − 原文字符数
-/// （原文就是候选工作区里的这一页，也就是 PageEdits 所对的基线；页面不存在时按 0 算）。
-/// 增长量超过上限就返回 COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED，details 写明增长量
-/// 和上限（只有计数，不含正文）。缩短、持平都放行。
+/// 做什么：只对 wiki/index.md、wiki/overview.md 生效。用 `structural_allowance` 算出本批
+/// 这一页整页最多允许多少字符（每批增量 + 绝对上限两道闸门取较严的那个），候选超过就
+/// 返回 COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED；details 只有计数和规则，不含正文。
+/// 缩短、持平都放行（原文已经超过上限的页也不要求一次缩回去）。
 ///
 /// 为什么要硬闸门：实际生效的 schema 早就写着"index/overview 只做必要导航调整"，
 /// 同期 index 仍从 439 字涨到 18.6 万字——只靠提示词约束已被证明无效。
 fn check_structural_page_growth(
+    policy: &StructuralPagePolicy,
     workspace: &Path,
     target: &str,
     candidate: &str,
-    limit_chars: usize,
+    sources: &[ResolvedCompileSource],
+    generated: &[CompileFile],
 ) -> Result<(), BackendError> {
-    if !matches!(target, "wiki/index.md" | "wiki/overview.md") {
+    let Some(allowance) = structural_allowance(policy, workspace, target, sources, generated)? else {
         return Ok(());
-    }
-    let baseline_chars = read_markdown(workspace, target, false)?
-        .map(|text| text.chars().count())
-        .unwrap_or(0);
+    };
+    let Some(max_chars) = allowance.max_candidate_chars else {
+        return Ok(());
+    };
     let candidate_chars = candidate.chars().count();
-    let growth_chars = candidate_chars.saturating_sub(baseline_chars);
-    if growth_chars <= limit_chars {
+    if candidate_chars <= max_chars {
         return Ok(());
     }
+    let baseline_chars = allowance.baseline_chars;
+    let growth_chars = candidate_chars.saturating_sub(baseline_chars);
+    // 本批允许的增长量（原文已超过额度时为 0）；沿用 V8 改动集 C 的字段名 limitCharacters。
+    let limit_chars = max_chars.saturating_sub(baseline_chars);
+    let rule = allowance.binding_rule.unwrap_or(StructuralRule::BatchGrowth);
+    let guidance = match rule {
+        StructuralRule::BatchGrowth => "Navigation pages must be updated in place without appending per-batch narrative; a batch with fewer Sources gets a smaller but proportionate allowance.",
+        StructuralRule::SizeCap => "This page has reached its size cap: beyond it, a batch may only add one concise navigation entry per new derived page and one citation per newly cited Source. Condense existing entries in place instead of appending.",
+    };
     Err(BackendError::new(
         "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED",
         format!(
-            "The `{target}` candidate grows by {growth_chars} characters, above the per-batch limit of {limit_chars}. Navigation pages must be updated in place without appending per-batch narrative; the candidate was rejected, not truncated."
+            "The `{target}` candidate has {candidate_chars} characters, above this batch's maximum of {max_chars} ({}). {guidance} The candidate was rejected, not truncated.",
+            rule.as_str()
         ),
         true,
         true,
     )
     .with_details(serde_json::json!({
         "path": target,
+        "rule": rule.as_str(),
         "baselineCharacters": baseline_chars,
         "candidateCharacters": candidate_chars,
         "growthCharacters": growth_chars,
         "limitCharacters": limit_chars,
+        "maxCandidateCharacters": max_chars,
+        "batchGrowthLimitCharacters": allowance.batch_growth_limit_chars,
+        "sizeCapCharacters": allowance.size_cap_chars,
+        "overCapAllowanceCharacters": allowance.over_cap_allowance_chars,
+        // 重试脚本据此判断：增量闸门拒绝、且本批不止 1 条来源时，拆成更小的组通常能过；
+        // 绝对上限拒绝时拆组没用。
+        "selectedSourceCount": allowance.selected_source_count,
+        "newlyCitedSourceCount": allowance.newly_cited_source_count,
+        "newDerivedPageCount": allowance.new_derived_page_count,
+        "splitMayHelp": rule == StructuralRule::BatchGrowth && allowance.selected_source_count > 1,
+        "fullRecompile": policy.full_recompile,
         "unit": "unicode_scalar_values",
         "limitEnv": STRUCTURAL_PAGE_GROWTH_ENV,
+        "sizeCapEnv": STRUCTURAL_PAGE_SIZE_CAPS_ENV,
     })))
 }
 
@@ -952,7 +1275,7 @@ fn page_prompt(
     page_prompt_parts(
         workspace, language, plan, target, sources, dependencies, generated, deletions,
         PageContextMode::Inline,
-        DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS,
+        &StructuralPagePolicy::defaults(false),
     )
     .map(|parts| parts.inline)
 }
@@ -961,12 +1284,32 @@ fn page_prompt(
 ///
 /// 做什么：要求就地更新导航，不追加"本轮/本次/历史阶段"这类逐批叙述小节；明确不得
 /// 删除任何已有的 raw/sources/... 引用（含 frontmatter 的 sources，index/overview 各有
-/// 约 300 条，重试脚本的轻量审阅按"旧引用只增不减"把关）；并告诉模型每批的增长上限，
-/// 超过会被后端整份拒绝。log.md 由后端本地追加，不用这条规则。
-fn structural_page_rule(target: &str, growth_limit_chars: usize) -> String {
-    format!(
-        "`{target}` is a navigation page: update its navigation in place. Edit existing entries or add one concise entry per new or materially changed derived page; do not append per-batch narrative, changelog or history sections (no sections titled 本轮, 本次, 历史阶段, this round, this batch or history). Never delete any existing `raw/sources/...` citation, including frontmatter `sources` entries. This batch may grow this page by at most {growth_limit_chars} characters; a larger candidate is rejected as a whole (COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED), never truncated."
-    )
+/// 约 300 条，重试脚本的轻量审阅按"旧引用只增不减"把关）；并告诉模型本批这一页整页
+/// 最多能有多少字符（与后端闸门用同一个 `structural_allowance` 算出），超过会被整份拒绝。
+/// 已经到达绝对上限时，额外说明"只能加新派生页的导航行和新来源的引用"。
+/// log.md 由后端本地追加，不用这条规则。
+fn structural_page_rule(target: &str, allowance: Option<&StructuralAllowance>) -> String {
+    let mut rule = format!(
+        "`{target}` is a navigation page: update its navigation in place. Edit existing entries or add one concise entry per new or materially changed derived page; do not append per-batch narrative, changelog or history sections (no sections titled 本轮, 本次, 历史阶段, this round, this batch or history). Never delete any existing `raw/sources/...` citation, including frontmatter `sources` entries."
+    );
+    let Some(allowance) = allowance else {
+        return rule;
+    };
+    if let Some(max_chars) = allowance.max_candidate_chars {
+        rule.push_str(&format!(
+            " Size limit for this batch: the complete `{target}` candidate may contain at most {max_chars} characters (Unicode characters; the current page has {}). A larger candidate is rejected as a whole (COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED), never truncated.",
+            allowance.baseline_chars
+        ));
+    }
+    if allowance.binding_rule == Some(StructuralRule::SizeCap) {
+        if let Some(cap) = allowance.size_cap_chars {
+            rule.push_str(&format!(
+                " This page is at its size cap of {cap} characters: beyond the cap it may only gain one concise navigation entry (at most {OVER_CAP_CHARS_PER_NEW_PAGE} characters) per new derived page and one citation (at most {OVER_CAP_CHARS_PER_NEW_CITATION} characters) per newly cited Source; this batch has {} new derived pages and {} newly cited Sources. Condense existing entries in place when you need more room.",
+                allowance.new_derived_page_count, allowance.newly_cited_source_count
+            ));
+        }
+    }
+    rule
 }
 
 /// 逐页提示的组装方式。
@@ -1023,12 +1366,14 @@ fn page_prompt_parts(
     generated: &[CompileFile],
     deletions: &std::collections::BTreeSet<String>,
     mode: PageContextMode,
-    structural_growth_limit_chars: usize,
+    structural: &StructuralPagePolicy,
 ) -> Result<PagePromptParts, BackendError> {
     let baseline = large_page_baseline(workspace, target)?;
     // V8：index/overview 用"就地更新导航"规则；派生页仍要求保留未改动的知识和历史。
     // log.md 不会走到模型这里（后端本地追加），所以只需区分这两类。
     let navigation = matches!(target, "wiki/index.md" | "wiki/overview.md");
+    // 本批这一页的体积额度（非结构页为 None）：写进提示，和闸门检查用的是同一个数。
+    let allowance = structural_allowance(structural, workspace, target, sources, generated)?;
     let mut prompt = if let Some(baseline) = &baseline {
         format!(
             "Return only PageEdits JSON matching {{path,baseSha256,edits:[{{before,after}}],deletions:[\"wiki/...md\"]}}. Follow the accepted CompilePlan. {access}\n{}\n{}\nGenerate only `{target}`. Return edits against the complete baseline below, with baseSha256 `{hash}`. Each nonempty before string must occur exactly once in the ORIGINAL baseline; all edits refer to that same baseline, must not overlap, and may not depend on earlier edits. Include enough adjacent text to identify an insertion point. {preserve} Return at most 32 edits and at most 64 KiB JSON; do not return the full page or a files array. {deletion_policy} Empty edits mean this page is unchanged. The backend reconstructs the entire candidate and subjects it to normal validation and review. Write new prose in the specified language.\n",
@@ -1036,7 +1381,7 @@ fn page_prompt_parts(
             crate::utils::i18n::language_instruction(language),
             hash = format!("{:x}", Sha256::digest(baseline.as_bytes())),
             preserve = if navigation {
-                structural_page_rule(target, structural_growth_limit_chars)
+                structural_page_rule(target, allowance.as_ref())
             } else {
                 "Preserve all unchanged knowledge, history, citations and formatting.".to_string()
             },
@@ -1059,7 +1404,7 @@ fn page_prompt_parts(
         ));
         // V8：小的或新建的 index/overview（整页返回）同样遵守"就地更新导航"规则和增长上限。
         if navigation {
-            header.push_str(&structural_page_rule(target, structural_growth_limit_chars));
+            header.push_str(&structural_page_rule(target, allowance.as_ref()));
             header.push('\n');
         }
         header
@@ -1550,6 +1895,7 @@ mod tests {
                 transport: PageTransportKind::WholeFile,
                 prompt: whole_file_prompt(target, &context),
                 context,
+                page_edits_baseline_in_file: None,
             }),
         }
     }
@@ -1558,40 +1904,55 @@ mod tests {
         AgentInputBudget::for_agent_with_overrides(agent, None)
     }
 
+    /// 20 万窗口的 Claude（硬上限 10 万 token ≈ 20 万字节，内联阈值 4 万 token）：代表 CLI
+    /// 按较小窗口处理的模型，用来在小体量的测试数据上触发分层和整体文件模式。
+    /// 默认窗口（opus 别名实测的 100 万）下这些测试数据都会直接内联。
+    fn narrow_claude() -> AgentInputBudget {
+        AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, Some("claude=200000"))
+    }
+
+    /// 测试用的结构页规则：默认值，不读环境变量。
+    fn test_structural() -> StructuralPagePolicy {
+        StructuralPagePolicy::defaults(false)
+    }
+
     // V8：交付方式按各 Agent 自己的预算判断（不再拿 Codex 的字符上限判断所有 Agent），
     // 文件模式只给具备只读文件工具的 Agent（Claude、Codex）；其余 Agent 永远内联。
     #[test]
     fn generation_context_transport_follows_each_agents_budget_and_requires_read_only_tools() {
         let (root, mut plan, sources) = fixture();
         let related = "wiki/concepts/相关页.md";
-        // 约 160KB（约 8 万 token）：超过 Claude 默认内联阈值（4 万），低于 Codex 的（10 万）。
+        // 约 160KB（约 8 万 token）：超过 20 万窗口 Claude 的内联阈值（4 万），低于 Codex 的
+        // （10 万）和默认 100 万窗口 Claude 的（20 万）。
         let body = format!("# Related\n{}RELATED_END", "相关页内容\n".repeat(10_000));
         std::fs::write(root.path().join(related), &body).unwrap();
         plan.items[0].affected_existing_pages.push(related.into());
         let target = plan.items[0].target_path.clone();
         let request_for = |budget: &AgentInputBudget| {
-            page_request(budget, DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, root.path(), "zh-CN", &plan, &target, &sources, &[], &[], &Default::default()).unwrap()
+            page_request(budget, &test_structural(), root.path(), "zh-CN", &plan, &target, &sources, &[], &[], &Default::default()).unwrap()
         };
-        let claude_request = request_for(&default_budget(AgentKind::Claude));
+        let claude_request = request_for(&narrow_claude());
         assert_eq!(claude_request.file_mode.as_ref().map(|mode| mode.transport), Some(PageTransportKind::Layered));
+        assert!(request_for(&default_budget(AgentKind::Claude)).file_mode.is_none(), "the default Claude window inlines this page");
         assert!(request_for(&default_budget(AgentKind::Codex)).file_mode.is_none(), "Codex's own budget decides, not a shared character limit");
         for agent in [AgentKind::Openclaw, AgentKind::Hermes] {
             assert!(request_for(&default_budget(agent)).file_mode.is_none(), "{agent:?} has no verified read-only file tools");
         }
         // 执行：文件模式在私有租约目录里运行，并告诉调用方要开只读工具；内联在原工作区、不开工具。
-        for (agent, expected) in [
-            (AgentKind::Claude, PageTransportKind::Layered),
-            (AgentKind::Codex, PageTransportKind::Inline),
-            (AgentKind::Openclaw, PageTransportKind::Inline),
-            (AgentKind::Hermes, PageTransportKind::Inline),
+        for (agent, budget, expected) in [
+            (AgentKind::Claude, narrow_claude(), PageTransportKind::Layered),
+            (AgentKind::Claude, default_budget(AgentKind::Claude), PageTransportKind::Inline),
+            (AgentKind::Codex, default_budget(AgentKind::Codex), PageTransportKind::Inline),
+            (AgentKind::Openclaw, default_budget(AgentKind::Openclaw), PageTransportKind::Inline),
+            (AgentKind::Hermes, default_budget(AgentKind::Hermes), PageTransportKind::Inline),
         ] {
-            let budget = default_budget(agent);
             let request = request_for(&budget);
             let lease = std::sync::Mutex::new(None);
             let out = complete_page_request(&budget, root.path(), &request, None, &|cwd, prompt, lane, call| {
                 assert!(lane.is_none());
                 assert_eq!(call.target, target);
                 assert_eq!(call.transport, expected, "{agent:?}");
+                assert!(call.page_edits_baseline_in_file.is_none(), "a new page has no PageEdits baseline");
                 if expected == PageTransportKind::Inline {
                     assert!(!call.transport.needs_read_only_tools());
                     assert_eq!(cwd, root.path());
@@ -1648,14 +2009,17 @@ mod tests {
             file_hash: "historical-file-hash".into(),
         }];
         let seen_layered = std::sync::Mutex::new(false);
+        // 约 26 万字节的上下文：用 20 万窗口的 Claude 触发分层（默认 100 万窗口会整页内联）。
+        let claude = narrow_claude();
         let manifest = generate_with_parallel_scaffolds_with_budget(
-            default_budget(AgentKind::Claude), root.path(), "zh-CN", &plan, &sources, &dependencies,
+            claude, root.path(), "zh-CN", &plan, &sources, &dependencies,
             |cwd, prompt, _lane, call| {
-                agent_plan::validate_input(AgentKind::Claude, prompt).unwrap();
+                claude.validate(prompt).unwrap();
                 if call.target != target {
                     return Ok(fragment(prompt));
                 }
                 assert_eq!(call.transport, PageTransportKind::Layered);
+                assert!(call.page_edits_baseline_in_file.is_none(), "the PageEdits baseline is inline");
                 assert!(prompt.contains("Return only PageEdits JSON"));
                 assert!(prompt.contains("--- Accepted CompilePlan ---"));
                 assert!(prompt.contains(&baseline), "the complete target baseline stays inline");
@@ -1686,36 +2050,124 @@ mod tests {
         let (root, mut plan, sources) = fixture();
         let target = plan.items[0].target_path.clone();
         plan.items[0].action = CompileAction::Update;
-        let claude = default_budget(AgentKind::Claude);
+        // 20 万窗口的 Claude：内联阈值 4 万 token、硬上限 10 万 token（约 20 万字节）。
+        let claude = narrow_claude();
         let request_for = |plan: &CompilePlan| {
-            page_request(&claude, DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, root.path(), "zh-CN", plan, &target, &sources, &[], &[], &Default::default()).unwrap()
+            page_request(&claude, &test_structural(), root.path(), "zh-CN", plan, &target, &sources, &[], &[], &Default::default()).unwrap()
         };
-        // 约 100KB（约 5 万 token）：超过 Claude 默认内联阈值 4 万、低于硬上限 10 万。
+        // 约 100KB（约 5 万 token）：超过内联阈值 4 万、低于硬上限 10 万。
         std::fs::write(root.path().join(&target), format!("# Page\n{}MEDIUM_END", "x".repeat(100_000))).unwrap();
         let request = request_for(&plan);
         assert!(request.file_mode.is_none(), "nothing can be deferred, so the page stays inline without tools");
         assert!(request.prompt.contains("MEDIUM_END"));
         // 约 260KB（约 13 万 token）：目标页基线本身就超过硬上限 → 整体文件模式。
-        std::fs::write(root.path().join(&target), format!("# Page\n{}HUGE_END", "y".repeat(260_000))).unwrap();
+        let huge = format!("# Page\n{}HUGE_END", "y".repeat(260_000));
+        std::fs::write(root.path().join(&target), &huge).unwrap();
         let related = "wiki/concepts/相关.md";
         std::fs::write(root.path().join(related), "# Related\nRELATED_SMALL").unwrap();
         plan.items[0].affected_existing_pages.push(related.into());
         let request = request_for(&plan);
         let file_mode = request.file_mode.as_ref().unwrap();
         assert_eq!(file_mode.transport, PageTransportKind::WholeFile);
+        // 目标页走 PageEdits、基线却不在提示里：标出基线字节数，调用方据此写警告日志。
+        assert_eq!(file_mode.page_edits_baseline_in_file, Some(huge.len()));
         assert!(file_mode.prompt.len() < 4096, "only metadata stays inline");
         assert!(file_mode.prompt.starts_with(&format!("Generate only `{target}`.")));
         assert!(file_mode.prompt.contains(&hash_bytes(file_mode.context.as_bytes())));
         assert!(file_mode.context.contains("HUGE_END") && file_mode.context.contains("RELATED_SMALL"));
         assert!(file_mode.context.contains("Return only PageEdits JSON"));
         assert!(file_mode.context.contains("Use read-only tools only to read generation-request.md"));
+        // 默认窗口（opus 别名实测的 100 万）下，同一页的基线可以内联，不会退到整体文件模式。
+        let default_request = page_request(&default_budget(AgentKind::Claude), &test_structural(), root.path(), "zh-CN", &plan, &target, &sources, &[], &[], &Default::default()).unwrap();
+        assert!(default_request.file_mode.is_none());
+        assert!(default_request.prompt.contains(&huge));
         let out = complete_page_request(&claude, root.path(), &request, None, &|cwd, prompt, _, call| {
             assert_eq!(call.transport, PageTransportKind::WholeFile);
+            assert_eq!(call.page_edits_baseline_in_file, Some(huge.len()));
             assert_eq!(prompt, file_mode.prompt);
             assert_eq!(std::fs::read_to_string(cwd.join("generation-request.md")).unwrap(), file_mode.context);
             Ok("ok".into())
         }).unwrap();
         assert_eq!(out, "ok");
+    }
+
+    /// 按真实知识库规模造一份 index.md（评审给的只读统计：204,613 字节、102,460 字符，
+    /// 10 行超过 2000 字符，最长 19,821）：一行很长的 frontmatter sources、9 行长导航段落
+    /// （最长那行以 LONGEST_LINE_END 结尾），其余是普通导航行，补到约 20.5 万字节。
+    fn real_scale_index() -> String {
+        let mut index = String::from("---\ntype: index\nsources: [");
+        for i in 0..300 {
+            index.push_str(&format!("\"raw/sources/local/6a{i:022x}.md\", "));
+        }
+        index.push_str("]\n---\n# 知识库导航\n");
+        // 最长的一行：19,821 个字符（中文 + 结尾标记）。
+        let marker = "LONGEST_LINE_END";
+        index.push_str(&"长".repeat(19_821 - marker.len()));
+        index.push_str(marker);
+        index.push('\n');
+        for line in 0..8 {
+            index.push_str(&format!("- 长段落导航 {line}：{}\n", "范围说明".repeat(800)));
+        }
+        let mut page = 0;
+        while index.len() < 204_613 {
+            index.push_str(&format!("- [[concepts/页面-{page:04}|页面 {page}]] — 专题范围与入口说明\n"));
+            page += 1;
+        }
+        index
+    }
+
+    // 评审确认的问题（V8 修正）：按默认配置，真实规模的 index.md（约 20.5 万字节、含长行）
+    // 必须把完整基线内联在提示里，PageEdits 的锚点直接对着原文（包括 19,821 字符的长行
+    // 末尾），不能退到"要模型自己读文件"的整体文件模式；只有把窗口调小到放不下时才会
+    // 退到整体文件模式，并标出基线字节数供调用方写警告。
+    #[test]
+    fn real_scale_index_baseline_stays_inline_under_the_default_claude_window() {
+        let (root, plan, sources) = fixture();
+        let index = real_scale_index();
+        assert!((204_000..=206_000).contains(&index.len()), "{}", index.len());
+        let long_lines = index.lines().filter(|line| line.chars().count() > 2000).count();
+        assert_eq!(long_lines, 10);
+        assert_eq!(index.lines().map(|line| line.chars().count()).max(), Some(19_821));
+        std::fs::write(root.path().join("wiki/index.md"), &index).unwrap();
+        let generated = vec![CompileFile::new("wiki/concepts/新知识.md", "# 新知识\n本批新页")];
+        let request_for = |budget: &AgentInputBudget| {
+            page_request(budget, &test_structural(), root.path(), "zh-CN", &plan, "wiki/index.md", &sources, &[], &generated, &Default::default()).unwrap()
+        };
+        // 默认 Claude 窗口：完整基线就在发给模型的提示里（内联或分层都可以，只要不是整体文件）。
+        let request = request_for(&default_budget(AgentKind::Claude));
+        let sent = match &request.file_mode {
+            None => &request.prompt,
+            Some(mode) => {
+                assert_eq!(mode.transport, PageTransportKind::Layered);
+                assert!(mode.page_edits_baseline_in_file.is_none());
+                &mode.prompt
+            }
+        };
+        assert!(sent.contains("Return only PageEdits JSON"), "a 205KB index is edited through PageEdits");
+        assert!(sent.contains(&index), "the complete index baseline, long lines included, stays inline");
+        default_budget(AgentKind::Claude).validate(sent).unwrap();
+        // Codex 默认窗口（50 万，硬上限约 50 万字节）同样放得下。
+        let codex = request_for(&default_budget(AgentKind::Codex));
+        assert!(codex.file_mode.as_ref().is_none_or(|mode| mode.transport == PageTransportKind::Layered));
+        // 端到端：PageEdits 锚在最长那行的末尾，按默认 Claude 预算逐页生成后能精确重建。
+        let manifest = generate_with_parallel_scaffolds_with_budget(
+            default_budget(AgentKind::Claude), root.path(), "zh-CN", &plan, &sources, &[],
+            |_, prompt, _, call| {
+                if call.target != "wiki/index.md" {
+                    return Ok(fragment(prompt));
+                }
+                assert!(call.page_edits_baseline_in_file.is_none());
+                assert!(prompt.contains("LONGEST_LINE_END"));
+                Ok(serde_json::json!({"path":"wiki/index.md","baseSha256":hash_bytes(index.as_bytes()),
+                    "edits":[{"before":"LONGEST_LINE_END","after":"LONGEST_LINE_END\n- [[concepts/新知识|新知识]] — 本批新页"}]}).to_string())
+            }, |_, _, _| Ok(())).unwrap();
+        let rebuilt = &manifest.files.iter().find(|file| file.path == "wiki/index.md").unwrap().content;
+        assert_eq!(rebuilt, &index.replace("LONGEST_LINE_END", "LONGEST_LINE_END\n- [[concepts/新知识|新知识]] — 本批新页"));
+        // 把窗口调小到放不下（20 万）：退到整体文件模式，并标出基线字节数。
+        let narrow = request_for(&narrow_claude());
+        let mode = narrow.file_mode.as_ref().unwrap();
+        assert_eq!(mode.transport, PageTransportKind::WholeFile);
+        assert_eq!(mode.page_edits_baseline_in_file, Some(index.len()));
     }
 
     // V8：文件模式的最终提示仍超过硬上限时，在建租约、启动命令行之前报错（只含计数）。
@@ -1729,6 +2181,7 @@ mod tests {
                 transport: PageTransportKind::Layered,
                 prompt: "必需内容".repeat(100_000),
                 context: "reference".into(),
+                page_edits_baseline_in_file: None,
             }),
         };
         let error = complete_page_request(&default_budget(AgentKind::Claude), root.path(), &request, None,
@@ -2461,55 +2914,107 @@ mod tests {
         assert!(!log.contains("候选生成记录"));
     }
 
-    /// 测试用：把结构页增长上限改成指定值的设置。
-    fn options_with_growth_limit(limit: usize) -> CandidateGenerationOptions {
-        CandidateGenerationOptions { structural_growth_limit_chars: limit, ..CandidateGenerationOptions::for_tests() }
+    /// 测试用：把结构页规则换成指定值的设置。
+    fn options_with_structural(policy: StructuralPagePolicy) -> CandidateGenerationOptions {
+        CandidateGenerationOptions { structural: policy, ..CandidateGenerationOptions::for_tests() }
     }
 
-    // V8 硬闸门：index/overview 候选相对原文增长超过上限就整份拒绝（明确错误码和计数），
-    // 正好等于上限、缩短都放行；按字符而不是字节计数；派生页不受这个闸门限制。
+    /// 测试用：只改每批增量的基数，其余（绝对上限、非全量重编）用默认值。
+    fn options_with_growth_limit(limit: usize) -> CandidateGenerationOptions {
+        options_with_structural(StructuralPagePolicy { base_growth_chars: limit, ..test_structural() })
+    }
+
+    /// 测试用：本批选了 `count` 条来源（第 1 条就是 fixture 里那条），派生页计划引用全部来源。
+    fn fixture_with_sources(count: usize) -> (tempfile::TempDir, CompilePlan, Vec<ResolvedCompileSource>) {
+        let (root, mut plan, mut sources) = fixture();
+        std::fs::create_dir_all(root.path().join("raw/sources/local")).unwrap();
+        for index in 1..count {
+            let path = format!("raw/sources/local/extra-{index:03}.md");
+            std::fs::write(root.path().join(&path), format!("# Extra {index}\nExtra evidence {index}")).unwrap();
+            sources.push(ResolvedCompileSource {
+                reference: SourceVersionRef {
+                    source_id: format!("extra-source-{index}"),
+                    version_id: format!("extra-version-{index}"),
+                    content_hash: format!("extra-hash-{index}"),
+                },
+                project_path: path.clone(),
+                workspace_path: path.clone(),
+                absolute_path: root.path().join(&path),
+                already_consumed: false,
+                registry: CompileSourceRegistry::V2,
+            });
+            plan.items[0].source_ids.push(path);
+        }
+        (root, plan, sources)
+    }
+
+    /// 测试用：index/overview 返回指定整页内容（None 表示用通用的小片段），派生页用通用片段。
+    fn structural_bodies(
+        index_body: Option<String>,
+        overview_body: Option<String>,
+    ) -> impl Fn(&str) -> Result<String, BackendError> + Sync {
+        move |prompt: &str| {
+            let target = requested_target(prompt);
+            let body = match target {
+                "wiki/index.md" => index_body.clone(),
+                "wiki/overview.md" => overview_body.clone(),
+                _ => None,
+            };
+            match body {
+                Some(content) => Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":content}],"deletions":[]}).to_string()),
+                None => Ok(fragment(prompt)),
+            }
+        }
+    }
+
+    // V8 硬闸门（每批增量）：原文超过小页豁免线时，index/overview 候选相对原文增长超过
+    // 本批上限就整份拒绝（明确错误码和计数），正好等于上限、缩短都放行；按字符而不是
+    // 字节计数；派生页不受这个闸门限制；闸门只拒绝候选，绝不改动工作区里的原文。
     #[test]
     fn structural_page_growth_over_the_limit_is_rejected_and_within_the_limit_passes() {
         let limit = 1_000;
+        // 约 2 万字符的 ASCII 原文：超过 16000 字符的小页豁免线，又低于 32KB（整页返回）。
+        let index_baseline = format!("# Index\n{}", "nav entry\n".repeat(2_000));
+        let overview_baseline = format!("# Overview\n{}", "status line\n".repeat(1_500));
         let run = |index_body: Option<String>, overview_body: Option<String>, derived_body: Option<String>| {
             let (root, plan, sources) = fixture();
-            std::fs::write(root.path().join("wiki/index.md"), "# Index\n原有导航\n").unwrap();
-            std::fs::write(root.path().join("wiki/overview.md"), "# Overview\n").unwrap();
+            std::fs::write(root.path().join("wiki/index.md"), &index_baseline).unwrap();
+            std::fs::write(root.path().join("wiki/overview.md"), &overview_baseline).unwrap();
+            let structural = structural_bodies(index_body, overview_body);
             let result = generate_with_test_options(&options_with_growth_limit(limit), root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
-                let target = requested_target(prompt);
-                let body = match target {
-                    "wiki/index.md" => index_body.clone(),
-                    "wiki/overview.md" => overview_body.clone(),
-                    _ => derived_body.clone(),
-                };
-                match body {
-                    Some(content) => Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":content}],"deletions":[]}).to_string()),
-                    None => Ok(fragment(prompt)),
+                match (&derived_body, requested_target(prompt)) {
+                    (Some(content), target) if !is_structural_page(target) => Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":content}],"deletions":[]}).to_string()),
+                    _ => structural(prompt),
                 }
             });
-            // 闸门只拒绝候选，绝不改动工作区里的原文。
-            assert_eq!(std::fs::read_to_string(root.path().join("wiki/index.md")).unwrap(), "# Index\n原有导航\n");
+            assert_eq!(std::fs::read_to_string(root.path().join("wiki/index.md")).unwrap(), index_baseline);
             result
         };
-        let index_baseline_chars = "# Index\n原有导航\n".chars().count();
-        // 超过上限 1 个字符：拒绝，details 写明增长量和上限。
-        let error = run(Some(format!("# Index\n原有导航\n{}", "新".repeat(limit + 1))), None, None).unwrap_err();
+        let index_baseline_chars = index_baseline.chars().count();
+        // 超过上限 1 个字符：拒绝，details 写明规则、增长量、上限和本批来源数。
+        let error = run(Some(format!("{index_baseline}{}", "新".repeat(limit + 1))), None, None).unwrap_err();
         assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
         let details = error.details.unwrap();
         assert_eq!(details["path"], "wiki/index.md");
+        assert_eq!(details["rule"], "per_batch_growth");
         assert_eq!(details["growthCharacters"], limit + 1);
         assert_eq!(details["limitCharacters"], limit);
+        assert_eq!(details["batchGrowthLimitCharacters"], limit);
         assert_eq!(details["baselineCharacters"], index_baseline_chars);
         assert_eq!(details["candidateCharacters"], index_baseline_chars + limit + 1);
+        assert_eq!(details["maxCandidateCharacters"], index_baseline_chars + limit);
+        assert_eq!(details["selectedSourceCount"], 1);
+        assert_eq!(details["splitMayHelp"], false, "a single-Source batch cannot be split further");
+        assert_eq!(details["fullRecompile"], false);
         assert!(!format!("{details}").contains("新新"), "errors carry counts, never page bodies");
         // 正好等于上限（3 字节的汉字按 1 个字符算）：放行，内容原样进入候选。
-        let exact = format!("# Index\n原有导航\n{}", "新".repeat(limit));
+        let exact = format!("{index_baseline}{}", "新".repeat(limit));
         let manifest = run(Some(exact.clone()), None, None).unwrap().manifest;
         assert_eq!(manifest.files.iter().find(|file| file.path == "wiki/index.md").unwrap().content, exact);
         // 缩短放行。
         assert!(run(Some("# Index\n".into()), None, None).is_ok());
         // overview 同样受限。
-        let error = run(None, Some(format!("# Overview\n{}", "x".repeat(limit + 1))), None).unwrap_err();
+        let error = run(None, Some(format!("{overview_baseline}{}", "x".repeat(limit + 1))), None).unwrap_err();
         assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
         assert_eq!(error.details.unwrap()["path"], "wiki/overview.md");
         // 派生页不受结构页闸门限制。
@@ -2520,13 +3025,11 @@ mod tests {
         assert!(run(None, None, Some(big_derived)).is_ok());
     }
 
-    // 大页面走 PageEdits 时同样受闸门约束：增长按"重建后的整页"相对基线计算。
+    // 大页面走 PageEdits 时同样受闸门约束：增长按"重建后的整页"相对基线计算；
+    // 增量上限按本批所选来源数放宽（评审确认的问题：固定上限误伤多来源批次）。
     #[test]
-    fn structural_growth_gate_also_covers_page_edits_and_new_navigation_pages() {
-        let (root, plan, sources) = fixture();
+    fn structural_growth_gate_covers_page_edits_and_scales_with_selected_sources() {
         let baseline = format!("# Index\n{}\nUNIQUE_ANCHOR\n", "历史导航条目\n".repeat(6_000));
-        std::fs::write(root.path().join("wiki/index.md"), &baseline).unwrap();
-        let limit = 2_000;
         let edit = |extra: usize| {
             let baseline = baseline.clone();
             move |prompt: &str| -> Result<String, BackendError> {
@@ -2538,27 +3041,177 @@ mod tests {
                 }
             }
         };
+        let limit = 2_000;
         let options = options_with_growth_limit(limit);
-        // 插入 "\n" + limit 个字符 = 增长 limit + 1：拒绝。
+        // 1 条来源：上限就是基数。插入 "\n" + limit 个字符 = 增长 limit + 1：拒绝。
+        let (root, plan, sources) = fixture();
+        std::fs::write(root.path().join("wiki/index.md"), &baseline).unwrap();
         let error = generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], edit(limit)).unwrap_err();
         assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
         assert_eq!(error.details.unwrap()["growthCharacters"], limit + 1);
         assert!(generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], edit(limit - 1)).is_ok());
-        // 还不存在的 overview（新知识库第一批）：按原文 0 字符计算增长。
-        let (root, plan, sources) = fixture();
-        let error = generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
-            let target = requested_target(prompt);
-            if target == "wiki/overview.md" {
-                Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":"概".repeat(limit + 1)}],"deletions":[]}).to_string())
-            } else {
-                Ok(fragment(prompt))
-            }
-        }).unwrap_err();
-        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
-        assert_eq!(error.details.unwrap()["baselineCharacters"], 0);
+        // 5 条来源：上限 = 基数 + 4 × 1000。增长正好等于上限放行，多 1 个字符拒绝，
+        // details 带上本批来源数，并提示拆组可能有用。
+        let (root, plan, sources) = fixture_with_sources(5);
+        std::fs::write(root.path().join("wiki/index.md"), &baseline).unwrap();
+        let scaled = limit + 4 * STRUCTURAL_GROWTH_CHARS_PER_EXTRA_SOURCE;
+        assert!(generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], edit(scaled - 1)).is_ok());
+        let error = generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], edit(scaled)).unwrap_err();
+        let details = error.details.unwrap();
+        assert_eq!(details["rule"], "per_batch_growth");
+        assert_eq!(details["batchGrowthLimitCharacters"], scaled);
+        assert_eq!(details["selectedSourceCount"], 5);
+        assert_eq!(details["splitMayHelp"], true);
     }
 
-    // 增长上限的环境变量只接受合法范围内的正整数，其余回退默认值。
+    // 默认规则下每批增量上限随来源数放宽、并且封顶：按真实快照，4 条来源的批次最大增长
+    // 5,461、5 条来源最大 5,894，默认上限分别是 7000、8000，都放得下；全量重编不设增量上限。
+    #[test]
+    fn structural_batch_growth_limit_scales_with_sources_and_is_capped() {
+        let policy = test_structural();
+        assert_eq!(policy.batch_growth_limit(0), Some(4_000));
+        assert_eq!(policy.batch_growth_limit(1), Some(4_000));
+        assert_eq!(policy.batch_growth_limit(2), Some(5_000));
+        assert_eq!(policy.batch_growth_limit(4), Some(7_000));
+        assert_eq!(policy.batch_growth_limit(5), Some(8_000));
+        assert!(policy.batch_growth_limit(4).unwrap() > 5_461 && policy.batch_growth_limit(5).unwrap() > 5_894);
+        assert_eq!(policy.batch_growth_limit(29), Some(MAX_STRUCTURAL_BATCH_GROWTH_CHARS));
+        assert_eq!(policy.batch_growth_limit(1_000), Some(MAX_STRUCTURAL_BATCH_GROWTH_CHARS));
+        // 运维把基数调得比封顶还大时，以基数为准（封顶不会把上限压回去）。
+        let wide = StructuralPagePolicy { base_growth_chars: 50_000, ..policy };
+        assert_eq!(wide.batch_growth_limit(10), Some(50_000));
+        assert_eq!(StructuralPagePolicy::defaults(true).batch_growth_limit(5), None);
+    }
+
+    // 评审确认的问题：新建或很小的知识库首批来源多时，overview 写出几千字的全局概述、
+    // index 写出逐页导航是正常行为，不能被增量闸门拒绝。
+    #[test]
+    fn new_or_small_navigation_pages_are_not_blocked_by_the_growth_gate() {
+        // 新知识库第一批：index/overview 还不存在，本批 20 条来源，overview 6000 字、index 9000 字。
+        let (root, plan, sources) = fixture_with_sources(20);
+        let overview = format!("# Overview\n{}", "全局概述".repeat(1_500));
+        let index = format!("# Index\n{}", "- [[concepts/页面|页面]] 导航\n".repeat(400));
+        assert!(overview.chars().count() > 6_000 && index.chars().count() > 9_000);
+        let manifest = generate_with_test_options(&CandidateGenerationOptions::for_tests(), root.path(), "zh-CN", &plan, &sources, &[],
+            structural_bodies(Some(index.clone()), Some(overview.clone()))).unwrap().manifest;
+        assert_eq!(manifest.files.iter().find(|file| file.path == "wiki/overview.md").unwrap().content, overview);
+        assert_eq!(manifest.files.iter().find(|file| file.path == "wiki/index.md").unwrap().content, index);
+        // 只有约 170 字起始模板的页面，本批 1 条来源：整页不超过 16000 字符都放行。
+        let starter = "---\ntype: overview\n---\n# Overview\n\nThis knowledge base is new. Summaries of the main themes will appear here after the first Update Wiki run integrates selected Sources into derived pages.\n";
+        let small = |body: String| {
+            let (root, plan, sources) = fixture();
+            std::fs::write(root.path().join("wiki/overview.md"), starter).unwrap();
+            generate_with_test_options(&CandidateGenerationOptions::for_tests(), root.path(), "zh-CN", &plan, &sources, &[],
+                structural_bodies(None, Some(body)))
+        };
+        assert!(small("概".repeat(STRUCTURAL_SMALL_PAGE_FREE_CHARS)).is_ok());
+        // 超过小页豁免线、又超过"原文 + 本批增量"：仍然拒绝，增量闸门没有失效。
+        let error = small("概".repeat(STRUCTURAL_SMALL_PAGE_FREE_CHARS + 1)).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        let details = error.details.unwrap();
+        assert_eq!(details["rule"], "per_batch_growth");
+        assert_eq!(details["maxCandidateCharacters"], STRUCTURAL_SMALL_PAGE_FREE_CHARS);
+        assert_eq!(details["baselineCharacters"], starter.chars().count());
+    }
+
+    // 全量重编（FullRecompile）是广义重写：不查每批增量，但绝对上限照样生效。
+    #[test]
+    fn full_recompile_skips_the_batch_growth_gate_but_keeps_the_size_cap() {
+        let cap = 100_000;
+        let baseline = format!("# Index\n{}", "nav entry\n".repeat(2_000));
+        let run = |full_recompile: bool, candidate_chars: usize| {
+            let (root, plan, sources) = fixture();
+            std::fs::write(root.path().join("wiki/index.md"), &baseline).unwrap();
+            let policy = StructuralPagePolicy { index_size_cap_chars: Some(cap), ..StructuralPagePolicy::defaults(full_recompile) };
+            let body = format!("{baseline}{}", "x".repeat(candidate_chars - baseline.chars().count()));
+            generate_with_test_options(&options_with_structural(policy), root.path(), "zh-CN", &plan, &sources, &[],
+                structural_bodies(Some(body), None))
+        };
+        // 增长约 4 万字符（连普通批次 32000 的增量封顶都超过）：普通批次拒绝，全量重编放行。
+        assert_eq!(run(false, 60_000).unwrap_err().details.unwrap()["rule"], "per_batch_growth");
+        assert!(run(true, 60_000).is_ok());
+        // 绝对上限：本批 1 个新派生页、1 条新引用的来源，上限之上最多再加 400 + 80 字符。
+        let ceiling = cap + OVER_CAP_CHARS_PER_NEW_PAGE + OVER_CAP_CHARS_PER_NEW_CITATION;
+        assert!(run(true, ceiling).is_ok());
+        let error = run(true, ceiling + 1).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        let details = error.details.unwrap();
+        assert_eq!(details["rule"], "size_cap");
+        assert_eq!(details["fullRecompile"], true);
+        assert_eq!(details["batchGrowthLimitCharacters"], serde_json::Value::Null);
+        assert_eq!(details["sizeCapCharacters"], cap);
+        assert_eq!(details["splitMayHelp"], false);
+    }
+
+    // 评审确认的问题：只限每批增量时，每批卡在上限以内就能一直累积。绝对上限之上，
+    // 每批只能给新派生页加导航行、给新引用的来源加引用；没有新页、新引用就一个字也不能涨。
+    #[test]
+    fn structural_size_cap_only_allows_navigation_for_new_pages_and_citations() {
+        let cap = 20_000;
+        let source_path = "raw/sources/中文 资料/来源.md";
+        let policy = StructuralPagePolicy { index_size_cap_chars: Some(cap), ..test_structural() };
+        // 原文 3 万字符（已超过上限）；`cited` 决定原文里是否已经引用了本批来源。
+        let over_cap_baseline = |cited: bool| {
+            let head = if cited { format!("---\ntype: index\nsources: [\"{source_path}\"]\n---\n") } else { "# Index\n".to_string() };
+            format!("{head}{}", "x".repeat(30_000 - head.chars().count()))
+        };
+        let run = |baseline: &str, derived_exists: bool, policy: StructuralPagePolicy, extra: usize| {
+            let (root, plan, sources) = fixture();
+            std::fs::write(root.path().join("wiki/index.md"), baseline).unwrap();
+            if derived_exists {
+                std::fs::write(root.path().join(&plan.items[0].target_path), "# 已有专题").unwrap();
+            }
+            let body = format!("{baseline}{}", "y".repeat(extra));
+            generate_with_test_options(&options_with_structural(policy), root.path(), "zh-CN", &plan, &sources, &[],
+                structural_bodies(Some(body), None))
+        };
+        // 1. 本批只更新已有专题、来源也已被引用：额度为 0，多 1 个字符就拒绝；持平、缩短放行。
+        let cited = over_cap_baseline(true);
+        let error = run(&cited, true, policy, 1).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        let details = error.details.unwrap();
+        assert_eq!(details["rule"], "size_cap");
+        assert_eq!(details["overCapAllowanceCharacters"], 0);
+        assert_eq!(details["newDerivedPageCount"], 0);
+        assert_eq!(details["newlyCitedSourceCount"], 0);
+        assert_eq!(details["maxCandidateCharacters"], 30_000);
+        assert_eq!(details["splitMayHelp"], false);
+        assert!(run(&cited, true, policy, 0).is_ok());
+        let (root, plan, sources) = fixture();
+        std::fs::write(root.path().join("wiki/index.md"), &cited).unwrap();
+        std::fs::write(root.path().join(&plan.items[0].target_path), "# 已有专题").unwrap();
+        assert!(generate_with_test_options(&options_with_structural(policy), root.path(), "zh-CN", &plan, &sources, &[],
+            structural_bodies(Some(cited[..cited.len() - 100].to_string()), None)).is_ok(), "shrinking an over-cap page is always allowed");
+        // 2. 本批新建 1 个派生页、来源也是第一次被引用：额度 400 + 80。
+        let uncited = over_cap_baseline(false);
+        let allowance = OVER_CAP_CHARS_PER_NEW_PAGE + OVER_CAP_CHARS_PER_NEW_CITATION;
+        assert!(run(&uncited, false, policy, allowance).is_ok());
+        let details = run(&uncited, false, policy, allowance + 1).unwrap_err().details.unwrap();
+        assert_eq!(details["newDerivedPageCount"], 1);
+        assert_eq!(details["newlyCitedSourceCount"], 1);
+        assert_eq!(details["overCapAllowanceCharacters"], allowance);
+        // 3. 原文在上限以内、候选越过上限：最多长到"上限 + 额度"。
+        let under = format!("# Index\n{}", "z".repeat(18_000));
+        let under_chars = under.chars().count();
+        assert!(run(&under, false, policy, cap + allowance - under_chars).is_ok());
+        assert_eq!(run(&under, false, policy, cap + allowance - under_chars + 1).unwrap_err().details.unwrap()["rule"], "size_cap");
+        // 4. 关闭绝对上限（环境变量写 off）：只剩每批增量闸门。
+        let no_cap = StructuralPagePolicy { index_size_cap_chars: None, ..policy };
+        assert!(run(&cited, true, no_cap, DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS).is_ok());
+        assert_eq!(run(&cited, true, no_cap, DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS + 1).unwrap_err().details.unwrap()["rule"], "per_batch_growth");
+        // 提示词告诉模型同一个上限：整页最多多少字符，以及"已到上限、只能加导航行和新引用"。
+        let (root, plan, sources) = fixture();
+        std::fs::write(root.path().join("wiki/index.md"), &cited).unwrap();
+        std::fs::write(root.path().join(&plan.items[0].target_path), "# 已有专题").unwrap();
+        let generated = vec![CompileFile::new(plan.items[0].target_path.clone(), "# 已有专题（更新）")];
+        let prompt = page_prompt_parts(root.path(), "zh-CN", &plan, "wiki/index.md", &sources, &[], &generated,
+            &Default::default(), PageContextMode::Inline, &policy).unwrap().inline;
+        assert!(prompt.contains("may contain at most 30000 characters"));
+        assert!(prompt.contains(&format!("is at its size cap of {cap} characters")));
+        assert!(prompt.contains("this batch has 0 new derived pages and 0 newly cited Sources"));
+    }
+
+    // 环境变量只接受合法范围内的值，其余回退默认值；绝对上限可以按页关闭。
     #[test]
     fn structural_growth_limit_override_is_bounded() {
         assert_eq!(DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, 4_000);
@@ -2567,10 +3220,24 @@ mod tests {
         for bad in ["", "0", "-1", "abc", "499", "200001", "99999999999"] {
             assert_eq!(parse_structural_growth_limit(Some(bad)), DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, "{bad}");
         }
+        let defaults = (Some(DEFAULT_INDEX_SIZE_CAP_CHARS), Some(DEFAULT_OVERVIEW_SIZE_CAP_CHARS));
+        assert_eq!(defaults, (Some(120_000), Some(60_000)));
+        assert_eq!(parse_structural_size_caps(None), defaults);
+        assert_eq!(parse_structural_size_caps(Some("")), defaults);
+        assert_eq!(parse_structural_size_caps(Some(" INDEX = 90_000 , Overview=70000")), (Some(90_000), Some(70_000)));
+        assert_eq!(parse_structural_size_caps(Some("overview=off")), (Some(DEFAULT_INDEX_SIZE_CAP_CHARS), None));
+        assert_eq!(parse_structural_size_caps(Some(" off ")), (None, None));
+        // 写错的条目（低于小页豁免线、非数字、过大、名字不认识）忽略，该页保持默认值。
+        assert_eq!(parse_structural_size_caps(Some("index=100,overview=abc,log=50000")), defaults);
+        assert_eq!(parse_structural_size_caps(Some("index=99999999")), defaults);
+        assert_eq!(parse_structural_size_caps(Some("index=16000")), (Some(16_000), Some(DEFAULT_OVERVIEW_SIZE_CAP_CHARS)));
+        // 默认上限高于第二期瘦身后真实知识库的体积（index 102,460、overview 46,573 字符）。
+        assert!(DEFAULT_INDEX_SIZE_CAP_CHARS > 102_460 && DEFAULT_OVERVIEW_SIZE_CAP_CHARS > 46_573);
     }
 
     // V8：给 index/overview 的提示不再要求"preserve existing history"，改为就地更新导航、
-    // 不追加逐批叙述、不删任何已有 raw/sources/... 引用，并写明增长上限；派生页提示不变。
+    // 不追加逐批叙述、不删任何已有 raw/sources/... 引用，并写明本批整页最多多少字符；
+    // 派生页提示不变。
     #[test]
     fn navigation_prompts_update_in_place_instead_of_preserving_history() {
         let (root, plan, sources) = fixture();
@@ -2580,28 +3247,32 @@ mod tests {
             "do not append per-batch narrative",
             "本轮, 本次, 历史阶段",
             "Never delete any existing `raw/sources/...` citation, including frontmatter `sources` entries",
-            "at most 4000 characters",
+            "Size limit for this batch",
             "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED",
         ];
         let prompt_for = |target: &str| {
             page_prompt(root.path(), "zh-CN", &plan, target, &sources, &[], &generated, &Default::default()).unwrap()
         };
-        // 小的/新建的导航页（整页返回）。
+        // 小的/新建的导航页（整页返回）：小页豁免，整页最多 16000 字符。
         for target in ["wiki/index.md", "wiki/overview.md"] {
             let prompt = prompt_for(target);
             for marker in rule_markers {
                 assert!(prompt.contains(marker), "{target} prompt lacks {marker}");
             }
+            assert!(prompt.contains("may contain at most 16000 characters"), "{target}");
+            assert!(!prompt.contains("is at its size cap"));
             assert!(!prompt.contains("preserve existing history"));
             assert!(prompt.contains("--- Generated derived pages; update navigation in place"));
         }
-        // 大的导航页（PageEdits）：规则替换掉"保留全部历史"那句。
-        std::fs::write(root.path().join("wiki/index.md"), format!("# Index\n{}", "导航\n".repeat(20_000))).unwrap();
+        // 大的导航页（PageEdits）：规则替换掉"保留全部历史"那句；上限 = 原文 + 本批增量。
+        let large = format!("# Index\n{}", "导航\n".repeat(20_000));
+        std::fs::write(root.path().join("wiki/index.md"), &large).unwrap();
         let prompt = prompt_for("wiki/index.md");
         assert!(prompt.contains("Return only PageEdits JSON"));
         for marker in rule_markers {
             assert!(prompt.contains(marker), "large index prompt lacks {marker}");
         }
+        assert!(prompt.contains(&format!("may contain at most {} characters", large.chars().count() + DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS)));
         assert!(!prompt.contains("Preserve all unchanged knowledge, history"));
         assert!(!prompt.contains("preserve existing history"));
         // 派生页：小页不带导航规则；大页仍要求保留未改动的知识、历史和引用。
@@ -2611,12 +3282,21 @@ mod tests {
         let prompt = prompt_for(derived);
         assert!(prompt.contains("Preserve all unchanged knowledge, history, citations and formatting."));
         assert!(!prompt.contains("update its navigation in place"));
-        // 上限来自设置：换一个上限，提示里的数字跟着变。
+        assert!(!prompt.contains("Size limit for this batch"));
+        // 上限来自设置：换一个增量基数，提示里的数字跟着变。
         let custom = page_prompt_parts(
-            root.path(), "zh-CN", &plan, "wiki/overview.md", &sources, &[], &generated, &Default::default(),
-            PageContextMode::Inline, 1_234,
+            root.path(), "zh-CN", &plan, "wiki/index.md", &sources, &[], &generated, &Default::default(),
+            PageContextMode::Inline, &StructuralPagePolicy { base_growth_chars: 1_234, ..test_structural() },
         ).unwrap().inline;
-        assert!(custom.contains("at most 1234 characters"));
+        assert!(custom.contains(&format!("may contain at most {} characters", large.chars().count() + 1_234)));
+        // 全量重编且关闭绝对上限：不限体积，提示里不写上限，但仍要求就地更新导航。
+        let unbounded = page_prompt_parts(
+            root.path(), "zh-CN", &plan, "wiki/index.md", &sources, &[], &generated, &Default::default(),
+            PageContextMode::Inline,
+            &StructuralPagePolicy { index_size_cap_chars: None, ..StructuralPagePolicy::defaults(true) },
+        ).unwrap().inline;
+        assert!(unbounded.contains("update its navigation in place"));
+        assert!(!unbounded.contains("Size limit for this batch"));
     }
 
     #[test]

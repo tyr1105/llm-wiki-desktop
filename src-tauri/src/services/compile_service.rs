@@ -346,6 +346,9 @@ impl CompileService {
         _protected_sources: &HashMap<String, String>,
         route: ResolvedCompileRoute,
         policy: CompileGenerationPolicy,
+        // V8：是否是 Update Wiki 的全量重编（FullRecompile）。只影响结构页体积闸门：
+        // 全量重编不查每批增量、只查绝对上限。其他路线传 false。
+        full_recompile: bool,
         services: &CompileExecutionServices<'_>,
         observer: &mut dyn CompileGenerationObserver,
     ) -> Result<CompileCandidate, BackendError> {
@@ -433,7 +436,8 @@ impl CompileService {
                 let (manifest, audit_record) = if plan.items.is_empty() {
                     (empty_manifest(&plan), None)
                 } else if policy == CompileGenerationPolicy::WorkflowReviewableDeletes {
-                    // V8：审计记录的落点（按任务编号）、生成时间和结构页增长上限。
+                    // V8：审计记录的落点（按任务编号）、生成时间和结构页体积规则。
+                    // 全量重编是对整个知识库的广义重写，结构页不查每批增量，只查绝对上限。
                     let options = agent_pages::CandidateGenerationOptions {
                         audit: agent_pages::CandidateAuditTarget {
                             compile_task_id: task_id.to_string(),
@@ -441,8 +445,7 @@ impl CompileService {
                                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                             audit_path: Self::candidate_audit_path(context, task_id)?,
                         },
-                        structural_growth_limit_chars:
-                            agent_pages::structural_growth_limit_from_env(),
+                        structural: agent_pages::StructuralPagePolicy::from_env(full_recompile),
                     };
                     let generated = agent_pages::generate_with_parallel_scaffolds_for_agent(
                         *agent,
@@ -476,6 +479,25 @@ impl CompileService {
                                     ),
                                 )
                                 .map_err(task_operation_error)?;
+                            // V8（评审修正）：目标页走 PageEdits、但基线没能内联（整体文件模式）时
+                            // 写一条警告：锚点要靠模型读文件，长行是否被截断尚未实测，截断会以
+                            // "Page edit anchor is absent" 失败。最常见的原因是环境变量把窗口
+                            // 设得比模型实际的小。
+                            if let Some(baseline_bytes) = call.page_edits_baseline_in_file {
+                                services
+                                    .task_service
+                                    .append_log(
+                                        task_id,
+                                        LogLevel::Warn,
+                                        format!(
+                                            "Page input for {}: the {} byte PageEdits baseline is not inline because the required inline context exceeds this Agent's hard input limit; edit anchors depend on the Agent reading generation-request.md. Check {} if the model's real context window is larger.",
+                                            call.target,
+                                            baseline_bytes,
+                                            agent_budget::CONTEXT_TOKENS_ENV,
+                                        ),
+                                    )
+                                    .map_err(task_operation_error)?;
+                            }
                             // 发出前按该 Agent 的预算核一次：超过硬上限就在启动命令行之前报
                             // COMPILE_AGENT_INPUT_TOO_LARGE，不浪费一次调用。
                             agent_plan::validate_input(*agent, prompt)?;

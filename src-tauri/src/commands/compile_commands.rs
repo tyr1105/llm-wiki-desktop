@@ -210,6 +210,8 @@ async fn run_compile(
             &protected_sources,
             concrete_route,
             CompileGenerationPolicy::LegacyNoDeletes,
+            // V8：手动整理不是 Update Wiki 的全量重编；这条路线也不走逐页生成和结构页闸门。
+            false,
             &services,
             &mut observer,
         )

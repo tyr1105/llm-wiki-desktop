@@ -268,6 +268,8 @@ where
             &protected_sources,
             concrete_route,
             CompileGenerationPolicy::WorkflowReviewableDeletes,
+            // V8：全量重编时结构页闸门只查绝对上限、不查每批增量（广义重写本来就会大改导航）。
+            mode == UpdateWikiMode::FullRecompile,
             &services.compile,
             &mut observer,
         )

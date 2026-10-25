@@ -25,11 +25,23 @@ pub(super) const CONTEXT_TOKENS_ENV: &str = "LLM_WIKI_AGENT_CONTEXT_TOKENS";
 /// V8 对 Codex 同时检查这个字符上限和 token 预算，两个都必须满足。
 pub(super) const CODEX_MAX_INPUT_CHARACTERS: usize = 1_048_576;
 
-/// Claude 默认窗口：保守取 200,000 tokens，不写死 1M。
-/// 原因：Claude CLI 2.1.259 不认识 `claude-*-5-5` 这类完整模型 ID，会按它
-/// 自己假定的较小窗口做自动压缩或本地拦截（实测 blocking_limit）。只有确认了
-/// 模型名和真实窗口之后，才用环境变量把它调大（例如 opus 别名实测为 1M）。
-const CLAUDE_DEFAULT_CONTEXT_TOKENS: u64 = 200_000;
+/// Claude 默认窗口：取 `opus` 别名的实测值 1,000,000 tokens。
+///
+/// 依据（设计说明"必须采纳的修正"：在逐个模型探测之前，Claude 的预算按 opus 别名的
+/// 实测值来设）：模型设为 `opus` 别名时，CLI 2.1.259
+/// 把它解析为 claude-opus-5，真实调用返回的上限是 `limit 1000000`。
+///
+/// 为什么不再用 200,000 的保守值（评审确认的问题）：本知识库每批都会更新的 index.md
+/// 有约 20.5 万字节（10 行超过 2000 字符，最长 19,821 字符），按 20 万窗口算硬上限只有
+/// 10 万 token ≈ 20 万字节，目标页基线放不进提示，只能退到整体文件模式，PageEdits 的
+/// 锚点要靠模型用 Read 读回来——而 Read 会不会截断长行还没实测。按实测窗口设预算，
+/// 基线就能一直内联在提示里。
+///
+/// 这不是"所有 Claude 模型都是 1M"：后端看不到包装脚本实际用哪个模型。如果改用 CLI
+/// 不认识的模型 ID（例如 claude-*-5-5，实测会按更小的假定窗口在本地 blocking_limit），
+/// 失败会被改动集 D 归类为 context_limit、明确报出来；那时应在启动后端时用
+/// LLM_WIKI_AGENT_CONTEXT_TOKENS（例如 `claude=200000`）把窗口调小。
+const CLAUDE_DEFAULT_CONTEXT_TOKENS: u64 = 1_000_000;
 
 /// Codex 默认窗口：500,000 tokens（来自调研背景信息，尚未实测，可用环境变量覆盖）。
 const CODEX_DEFAULT_CONTEXT_TOKENS: u64 = 500_000;
@@ -303,8 +315,15 @@ impl AgentInputBudget {
     pub(super) fn describe(&self) -> String {
         match (self.context_tokens, self.inline_tokens, self.hard_tokens) {
             (Some(context), Some(inline), Some(hard)) => format!(
-                "inline threshold {inline} / hard limit {hard} of a {context}-token window ({})",
-                self.window_source.as_str()
+                "inline threshold {inline} / hard limit {hard} of a {context}-token window ({}){}",
+                self.window_source.as_str(),
+                // Claude 用默认窗口时提醒一句它的来历：这是 opus 别名的实测值，换了模型
+                // 就要在启动后端时用环境变量改，否则 CLI 可能在本地按更小的窗口拦截。
+                if self.agent == AgentKind::Claude && self.window_source == WindowSource::Default {
+                    format!("; default is the measured window of the `opus` alias, set {CONTEXT_TOKENS_ENV} for other models")
+                } else {
+                    String::new()
+                }
             ),
             _ => "no verified token window (unbounded, V7 behavior)".to_string(),
         }
@@ -316,15 +335,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_conservative_and_codex_keeps_its_cli_limit() {
-        // Claude 默认不按 1M 算，而是保守的 200,000；阈值是 20% 和 50%。
+    fn defaults_follow_measured_windows_and_codex_keeps_its_cli_limit() {
+        // Claude 默认按 opus 别名的实测窗口 1,000,000 算；阈值是 20% 和 50%。
         let claude = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, None);
-        assert_eq!(claude.context_tokens, Some(200_000));
-        assert_eq!(claude.inline_tokens, Some(40_000));
-        assert_eq!(claude.hard_tokens, Some(100_000));
+        assert_eq!(claude.context_tokens, Some(1_000_000));
+        assert_eq!(claude.inline_tokens, Some(200_000));
+        assert_eq!(claude.hard_tokens, Some(500_000));
         assert_eq!(claude.cli_character_units, None);
         assert!(claude.read_only_tools);
         assert_eq!(claude.window_source, WindowSource::Default);
+        // 任务日志里写明默认值的来历，并提示换模型时用哪个环境变量改。
+        assert!(claude.describe().contains("measured window of the `opus` alias"));
+        assert!(claude.describe().contains(CONTEXT_TOKENS_ENV));
+        // 评审确认的场景：真实 index.md 约 20.5 万字节（含长行），整页加上计划和来源
+        // 也远在默认硬上限（100 万字节）以内，目标页基线可以一直内联。
+        assert!(claude.validate(&"索".repeat(205_000)).is_ok());
         // Codex 同时保留 1,048,576 字符的 CLI 硬上限。
         let codex = AgentInputBudget::for_agent_with_overrides(AgentKind::Codex, None);
         assert_eq!(codex.context_tokens, Some(500_000));
@@ -347,7 +372,8 @@ mod tests {
         assert_eq!(estimate_tokens("ab"), 1);
         // 一个汉字 3 字节，按 ÷2 估算为 2 token，偏保守。
         assert_eq!(estimate_tokens("中"), 2);
-        let claude = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, None);
+        // 用 20 万窗口（例如 CLI 不认识、按较小窗口处理的模型）验证边界换算。
+        let claude = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, Some("claude=200000"));
         // 200,000 字节 = 100,000 token，正好等于硬上限，允许。
         claude.validate(&"a".repeat(200_000)).unwrap();
         let error = claude.validate(&"a".repeat(200_001)).unwrap_err();
@@ -358,10 +384,17 @@ mod tests {
         assert_eq!(details["hardTokens"], 100_000);
         assert_eq!(details["tokenUnit"], "utf8_bytes_div_2");
         assert_eq!(details["exceededLimits"][0], "context_token_budget");
+        assert_eq!(details["windowSource"], "env_override");
         assert!(!format!("{error:?}").contains("aaaa"), "errors carry counts, never prompt bodies");
         // 内联阈值：80,000 字节 = 40,000 token 以内整篇内嵌，多 1 个 token 就切换。
         assert!(claude.fits_inline(&"a".repeat(80_000)));
         assert!(!claude.fits_inline(&"a".repeat(80_001)));
+        // 默认窗口（100 万）下的同一组边界：硬上限 50 万 token = 100 万字节。
+        let default = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, None);
+        default.validate(&"a".repeat(1_000_000)).unwrap();
+        assert_eq!(default.validate(&"a".repeat(1_000_001)).unwrap_err().details.unwrap()["hardTokens"], 500_000);
+        assert!(default.fits_inline(&"a".repeat(400_000)));
+        assert!(!default.fits_inline(&"a".repeat(400_001)));
     }
 
     #[test]
@@ -402,8 +435,12 @@ mod tests {
         let openclaw = AgentInputBudget::for_agent_with_overrides(AgentKind::Openclaw, Some(raw));
         assert_eq!(openclaw.context_tokens, None);
         let typo = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, Some("claude=1000,claude=abc"));
-        assert_eq!(typo.context_tokens, Some(200_000));
+        assert_eq!(typo.context_tokens, Some(1_000_000));
         assert_eq!(typo.window_source, WindowSource::Default);
+        // 环境变量也能把 Claude 窗口调小（换成 CLI 按较小窗口处理的模型时）。
+        let smaller = AgentInputBudget::for_agent_with_overrides(AgentKind::Claude, Some("claude=200000"));
+        assert_eq!(smaller.hard_tokens, Some(100_000));
+        assert!(!smaller.describe().contains("opus"), "the opus hint only accompanies the default window");
         // 同一 Agent 写多次，以最后一个合法值为准。
         assert_eq!(context_override_for(AgentKind::Claude, "claude=300000,claude=400000"), Some(400_000));
         // 未经验证的 Agent 也可以由用户显式开启预算。
@@ -417,12 +454,12 @@ mod tests {
         // 用独占的变量名，避免与并行测试读写真实变量名互相干扰；
         // 生产入口 for_agent 读的是 CONTEXT_TOKENS_ENV，走同一段代码。
         let name = format!("LLM_WIKI_AGENT_CONTEXT_TOKENS_TEST_{}", uuid::Uuid::new_v4().simple());
-        assert_eq!(AgentInputBudget::from_env_var(AgentKind::Claude, &name).context_tokens, Some(200_000));
-        std::env::set_var(&name, "claude=1000000,codex=400000");
+        assert_eq!(AgentInputBudget::from_env_var(AgentKind::Claude, &name).context_tokens, Some(1_000_000));
+        std::env::set_var(&name, "claude=300000,codex=400000");
         let claude = AgentInputBudget::from_env_var(AgentKind::Claude, &name);
         let codex = AgentInputBudget::from_env_var(AgentKind::Codex, &name);
         std::env::remove_var(&name);
-        assert_eq!(claude.context_tokens, Some(1_000_000));
+        assert_eq!(claude.context_tokens, Some(300_000));
         assert_eq!(claude.window_source, WindowSource::EnvOverride);
         assert_eq!(codex.context_tokens, Some(400_000));
         assert!(claude.describe().contains("env_override"));
