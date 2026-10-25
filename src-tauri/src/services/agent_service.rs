@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +30,29 @@ const ROUTE_PROBE_STABILITY_ATTEMPTS: usize = 3;
 const AGENT_PROBE_PROTOCOL_REVISION: u32 = 1;
 const MAX_AGENT_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AGENT_RUNTIME: Duration = Duration::from_secs(15 * 60);
+
+/// V8.1：逐页并行生成时，同一批里另一页已经失败、这一路调用被主动停下（或干脆不再启动）
+/// 时返回的错误码。
+///
+/// 为什么要单独一个码：整组失败时要报"真正出错的那一页"的错误（例如 AGENT_EXIT_FAILED、
+/// 坏 JSON），被连带停下的各路只是后果。agent_pages 收集一批结果时据此把它们排在后面，
+/// 只有整批找不到别的错误时才会报这个码。
+pub(crate) const PAGE_BATCH_ABORTED: &str = "COMPILE_PAGE_BATCH_ABORTED";
+
+/// V8.1：同批另一页失败后，这一路调用被停下时的错误（见 [`PAGE_BATCH_ABORTED`]）。
+pub(crate) fn page_batch_aborted_error() -> BackendError {
+    BackendError::new(
+        PAGE_BATCH_ABORTED,
+        "Another page in the same parallel generation batch failed; this page call was stopped.",
+        true,
+        false,
+    )
+}
+
+/// V8.1：读"同批中止"信号。没有信号（串行调用）时永远是 false。
+fn batch_aborted(abort: Option<&AtomicBool>) -> bool {
+    abort.is_some_and(|abort| abort.load(AtomicOrdering::SeqCst))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentInvocation {
@@ -152,6 +176,38 @@ pub trait ProcessRunner: Send + Sync {
             tasks,
             task_id,
             credential_agent,
+            on_activity,
+        )
+    }
+
+    /// V8.1：逐页并行生成用的隔离调用。和 `run_task_streaming_isolated_with_all_events`
+    /// 完全相同，只多一个"同批中止"信号 `abort`：同一批里另一页失败（或其线程 panic）时
+    /// 它被置位，这一路正在运行的子进程要尽快被终止，不能等它自然跑完（最长 15 分钟）。
+    ///
+    /// 默认实现给测试替身和第三方 runner 用：它们没有可中断的等待循环，只能在启动前
+    /// 检查一次信号，然后照旧调用。系统 runner（`SystemProcessRunner`）覆盖它，在等待
+    /// 子进程的循环里和"任务取消"一起检查，置位后终止整个进程组并返回
+    /// [`PAGE_BATCH_ABORTED`]。
+    #[allow(clippy::too_many_arguments)]
+    fn run_task_streaming_isolated_abortable(
+        &self,
+        invocation: &AgentInvocation,
+        tasks: &TaskService,
+        task_id: &str,
+        credential_agent: Option<AgentKind>,
+        on_delta: &(dyn Fn(&str) + Sync),
+        on_activity: &(dyn Fn(TaskActivity) + Sync),
+        abort: &AtomicBool,
+    ) -> Result<String, BackendError> {
+        if abort.load(AtomicOrdering::SeqCst) {
+            return Err(page_batch_aborted_error());
+        }
+        self.run_task_streaming_isolated_with_all_events(
+            invocation,
+            tasks,
+            task_id,
+            credential_agent,
+            on_delta,
             on_activity,
         )
     }
@@ -1313,11 +1369,16 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
         tasks: &TaskService,
         task_id: &str,
     ) -> Result<String, BackendError> {
-        self.run_task_streaming_for_agent_with_lane(kind, invocation, tasks, task_id, None)
+        self.run_task_streaming_for_agent_with_lane(kind, invocation, tasks, task_id, None, None)
     }
 
     // Parallel compile scaffolds share cancellation and task persistence, but
     // their activity identities and transient output streams must not collide.
+    //
+    // V8.1：逐页并行（派生专题页每批最多 4 路，加上 index/overview 两页）沿用同一套
+    // lane 机制：lane 就是目标页路径，活动事件名带上它，流式文字不往界面推（几路同时
+    // 推会串在一起）。`abort` 是同批共享的中止信号：串行调用传 None，行为与 V8 完全相同；
+    // 并行调用传 Some，同批另一页失败后这一路不再启动，已启动的子进程被系统 runner 终止。
     pub(crate) fn run_task_streaming_for_agent_with_lane(
         &self,
         kind: AgentKind,
@@ -1325,7 +1386,12 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
         tasks: &TaskService,
         task_id: &str,
         lane: Option<&str>,
+        abort: Option<&AtomicBool>,
     ) -> Result<String, BackendError> {
+        // 同批另一页已经失败：整组注定失败，这一路连核对和启动都省掉。
+        if batch_aborted(abort) {
+            return Err(page_batch_aborted_error());
+        }
         let invocation = self.bind_verified_agent_invocation(kind, invocation)?;
         let on_activity = |activity: TaskActivity| {
             if let Some(activity) = compile_lane_activity(activity, lane) {
@@ -1349,14 +1415,26 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
             status: TaskActivityStatus::Started,
             label: Some("Agent started".into()),
         });
-        let result = self.runner.run_task_streaming_isolated_with_all_events(
-            &invocation,
-            tasks,
-            task_id,
-            Some(kind),
-            &on_delta,
-            &on_activity,
-        );
+        let result = match abort {
+            // V8.1：并行的一路，用可被同批中止的调用。
+            Some(abort) => self.runner.run_task_streaming_isolated_abortable(
+                &invocation,
+                tasks,
+                task_id,
+                Some(kind),
+                &on_delta,
+                &on_activity,
+                abort,
+            ),
+            None => self.runner.run_task_streaming_isolated_with_all_events(
+                &invocation,
+                tasks,
+                task_id,
+                Some(kind),
+                &on_delta,
+                &on_activity,
+            ),
+        };
         on_activity(TaskActivity::Phase {
             name: "agent".into(),
             status: if result.is_ok() {
@@ -1802,6 +1880,32 @@ impl ProcessRunner for SystemProcessRunner {
         )
     }
 
+    // V8.1：与上面的 `run_task_streaming_isolated_with_all_events` 相同（同样的捕获上限、
+    // 运行时限、日志持久化），只是等待循环里多查一个同批中止信号。
+    fn run_task_streaming_isolated_abortable(
+        &self,
+        invocation: &AgentInvocation,
+        tasks: &TaskService,
+        task_id: &str,
+        credential_agent: Option<AgentKind>,
+        on_delta: &(dyn Fn(&str) + Sync),
+        on_activity: &(dyn Fn(TaskActivity) + Sync),
+        abort: &AtomicBool,
+    ) -> Result<String, BackendError> {
+        run_streaming_process_with_events_limits_and_abort(
+            invocation,
+            tasks,
+            task_id,
+            on_delta,
+            on_activity,
+            true,
+            credential_agent,
+            MAX_AGENT_CAPTURE_BYTES,
+            MAX_AGENT_RUNTIME,
+            Some(abort),
+        )
+    }
+
     fn run_import_assistance(
         &self,
         invocation: &AgentInvocation,
@@ -2029,6 +2133,41 @@ fn run_streaming_process_with_events_and_limits(
     max_capture_bytes: usize,
     max_runtime: Duration,
 ) -> Result<String, BackendError> {
+    run_streaming_process_with_events_limits_and_abort(
+        invocation,
+        tasks,
+        task_id,
+        on_delta,
+        on_activity,
+        persist_output_logs,
+        credential_agent,
+        max_capture_bytes,
+        max_runtime,
+        None,
+    )
+}
+
+/// 带"同批中止"信号的子进程运行循环（V8.1）。`abort` 为 None 时与 V8 的行为逐字节相同；
+/// 为 Some 时，在每处检查任务取消的地方紧接着检查它：置位就终止整个进程组（含子孙进程），
+/// 返回 [`PAGE_BATCH_ABORTED`]。任务取消仍然优先（先查取消），所以用户取消时各路报的
+/// 都是 AGENT_CANCELLED。
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_process_with_events_limits_and_abort(
+    invocation: &AgentInvocation,
+    tasks: &TaskService,
+    task_id: &str,
+    on_delta: &(dyn Fn(&str) + Sync),
+    on_activity: &(dyn Fn(TaskActivity) + Sync),
+    persist_output_logs: bool,
+    credential_agent: Option<AgentKind>,
+    max_capture_bytes: usize,
+    max_runtime: Duration,
+    abort: Option<&AtomicBool>,
+) -> Result<String, BackendError> {
+    // 同批另一页在本路启动前就失败了：不再启动子进程。
+    if batch_aborted(abort) {
+        return Err(page_batch_aborted_error());
+    }
     let started = Instant::now();
     let mut command = build_command(
         &invocation.program,
@@ -2104,6 +2243,11 @@ fn run_streaming_process_with_events_and_limits(
                 false,
             ));
         }
+        // V8.1：同批另一页已失败，整组注定失败，立即终止这一路的进程组。
+        if batch_aborted(abort) {
+            process_lifetime.terminate(&mut child);
+            return Err(page_batch_aborted_error());
+        }
         if started.elapsed() > max_runtime {
             process_lifetime.terminate(&mut child);
             return Err(BackendError::new(
@@ -2150,6 +2294,13 @@ fn run_streaming_process_with_events_and_limits(
                                 true,
                                 false,
                             ));
+                        }
+                        // V8.1：主进程已退出、但子孙进程还占着管道时，同样响应同批中止。
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            if batch_aborted(abort) =>
+                        {
+                            process_lifetime.terminate(&mut child);
+                            return Err(page_batch_aborted_error());
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                             if started.elapsed() > max_runtime =>
@@ -4638,6 +4789,184 @@ mod tests {
             leases[0].path().join("runtime-home"),
             leases[1].path().join("runtime-home")
         );
+    }
+
+    // V8.1 要求：取消任务时所有并行的 Agent 子进程都被终止；同批另一页失败（中止信号置位）
+    // 时同样终止每一路的整个进程组（含子孙进程），且不把任务本身标成"已取消"。
+    #[cfg(unix)]
+    #[test]
+    fn parallel_page_lanes_terminate_every_process_group_on_cancel_or_sibling_failure() {
+        for cancel_task in [true, false] {
+            let owner = std::env::temp_dir().join("llm-wiki-desktop");
+            ensure_private_directory(&owner).unwrap();
+            let leases = (0..3)
+                .map(|_| {
+                    tempfile::Builder::new()
+                        .prefix("cancel-page-lane-")
+                        .tempdir_in(&owner)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let tasks = TaskService::default();
+            let task = tasks.create_task(
+                TaskType::WikiCompile,
+                Some("synthetic".into()),
+                "parallel page lanes".into(),
+                true,
+            );
+            let abort = AtomicBool::new(false);
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                let handles = leases.iter().map(|lease| {
+                    let tasks = &tasks; let id = &task.id; let abort = &abort;
+                    scope.spawn(move || {
+                        run_streaming_process_with_events_limits_and_abort(&AgentInvocation {
+                            program:"/bin/sh".into(),
+                            args:vec!["-c".into(), "(printf ready > child-ready; while [ ! -f release ]; do sleep 0.02; done; printf orphan > orphan) & wait".into()],
+                            stdin:None, cwd:lease.path().to_path_buf(),
+                        }, tasks, id, &|_| {}, &|_| {}, false, None, 1024, Duration::from_secs(5), Some(abort))
+                    })
+                }).collect::<Vec<_>>();
+                while leases
+                    .iter()
+                    .any(|lease| !lease.path().join("child-ready").exists())
+                    && start.elapsed() < Duration::from_secs(3)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let all_started = leases
+                    .iter()
+                    .all(|lease| lease.path().join("child-ready").exists());
+                if cancel_task {
+                    tasks.request_cancel(&task.id).unwrap();
+                } else {
+                    abort.store(true, AtomicOrdering::SeqCst);
+                }
+                for handle in handles {
+                    assert_eq!(
+                        handle.join().unwrap().unwrap_err().code,
+                        if cancel_task { "AGENT_CANCELLED" } else { PAGE_BATCH_ABORTED }
+                    );
+                }
+                assert!(all_started, "all three lanes must run at the same time");
+            });
+            assert!(start.elapsed() < Duration::from_secs(4));
+            assert_eq!(
+                tasks.is_cancelled(&task.id),
+                cancel_task,
+                "a sibling failure stops the lanes without cancelling the task"
+            );
+            for lease in &leases {
+                std::fs::write(lease.path().join("release"), "release").unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            for lease in &leases {
+                assert!(
+                    !lease.path().join("orphan").exists(),
+                    "every lane's process group must be reaped"
+                );
+            }
+        }
+    }
+
+    /// V8.1 测试用：只记调用次数的 runner。
+    #[derive(Default)]
+    struct CountingRunner {
+        calls: AtomicUsize,
+    }
+
+    impl ProcessRunner for CountingRunner {
+        fn find_executable(&self, _command: &str) -> Option<PathBuf> {
+            None
+        }
+        fn run_with_timeout(
+            &self,
+            _command: &str,
+            _args: &[&str],
+            _timeout: Duration,
+        ) -> Result<String, BackendError> {
+            panic!("an aborted page lane must not probe the Agent")
+        }
+        fn run_capture(
+            &self,
+            _invocation: &AgentInvocation,
+        ) -> Result<(String, String), BackendError> {
+            panic!("an aborted page lane must not capture output")
+        }
+        fn run_task_streaming(
+            &self,
+            _invocation: &AgentInvocation,
+            _tasks: &TaskService,
+            _task_id: &str,
+        ) -> Result<String, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ran".into())
+        }
+    }
+
+    // V8.1：同批另一页已经失败后，系统 runner、默认 runner 实现和 AgentService 都不再启动
+    // 这一路；信号未置位时默认实现照旧调用（测试替身和第三方 runner 不受影响）。
+    #[test]
+    fn page_lane_abort_signal_prevents_launch_everywhere() {
+        let tasks = TaskService::default();
+        let task = tasks.create_task(
+            TaskType::WikiCompile,
+            Some("synthetic".into()),
+            "aborted page lane".into(),
+            true,
+        );
+        let lease = tempfile::tempdir().unwrap();
+        let invocation = AgentInvocation {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf started > started".into()],
+            stdin: None,
+            cwd: lease.path().to_path_buf(),
+        };
+        let aborted = AtomicBool::new(true);
+        let error = SystemProcessRunner
+            .run_task_streaming_isolated_abortable(
+                &invocation, &tasks, &task.id, None, &|_| {}, &|_| {}, &aborted,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, PAGE_BATCH_ABORTED);
+        assert!(!lease.path().join("started").exists(), "no process may start");
+
+        let runner = CountingRunner::default();
+        assert_eq!(
+            runner
+                .run_task_streaming_isolated_abortable(
+                    &invocation, &tasks, &task.id, None, &|_| {}, &|_| {}, &aborted,
+                )
+                .unwrap_err()
+                .code,
+            PAGE_BATCH_ABORTED
+        );
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+        let clear = AtomicBool::new(false);
+        assert_eq!(
+            runner
+                .run_task_streaming_isolated_abortable(
+                    &invocation, &tasks, &task.id, None, &|_| {}, &|_| {}, &clear,
+                )
+                .unwrap(),
+            "ran"
+        );
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+
+        let runner = Arc::new(CountingRunner::default());
+        let service = AgentService::with_runner(runner.clone());
+        let error = service
+            .run_task_streaming_for_agent_with_lane(
+                AgentKind::Claude,
+                &invocation,
+                &tasks,
+                &task.id,
+                Some("wiki/concepts/a.md"),
+                Some(&aborted),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, PAGE_BATCH_ABORTED);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Default)]

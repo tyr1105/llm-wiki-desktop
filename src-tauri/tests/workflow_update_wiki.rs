@@ -2950,3 +2950,339 @@ async fn regression_broken_legacy_index_is_isolated_until_legacy_evidence_is_req
         }
     }
 }
+
+// ---------------- V8.1：派生专题页分批并行（走真实的 Update Wiki 工作流） ----------------
+
+/// V8.1 集成测试的计划：4 个派生页。前 3 页互不依赖，应同批并行；第 4 页在
+/// affectedExistingPages 里点名第 1 页（本次新建），应留到下一批，读到第 1 页刚生成的候选。
+const PARALLEL_PAGES: [&str; 4] = [
+    "wiki/concepts/并行一.md",
+    "wiki/concepts/并行二.md",
+    "wiki/concepts/并行三.md",
+    "wiki/concepts/并行四.md",
+];
+
+/// V8.1 集成测试用的 Agent：回答规划和逐页请求，并记录哪些页走了"可被同批中止"的并行调用。
+/// `fail_target` 有值时，那一页报 Agent 失败；同批其他页像真实 runner 一样等同批中止信号，
+/// 看到后报连带停止的错误。
+struct ParallelPagesAgent {
+    fail_target: Option<&'static str>,
+    arrived: (std::sync::Mutex<Vec<String>>, std::sync::Condvar),
+    abortable: std::sync::Mutex<Vec<(String, PathBuf)>>,
+    stopped: std::sync::atomic::AtomicUsize,
+    prompts: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl ParallelPagesAgent {
+    fn new(fail_target: Option<&'static str>) -> Self {
+        Self {
+            fail_target,
+            arrived: Default::default(),
+            abortable: Default::default(),
+            stopped: Default::default(),
+            prompts: Default::default(),
+        }
+    }
+
+    fn requested_target(invocation: &AgentInvocation) -> Option<String> {
+        invocation
+            .stdin
+            .as_deref()?
+            .lines()
+            .find_map(|line| line.strip_prefix("Generate only `")?.split('`').next())
+            .map(String::from)
+    }
+
+    /// 前 3 个派生页要等彼此都开始后才继续：证明它们确实同时在跑。
+    fn arrive_and_wait_for_batch(&self, target: &str) {
+        if !PARALLEL_PAGES[..3].contains(&target) {
+            return;
+        }
+        let mut arrived = self.arrived.0.lock().unwrap();
+        arrived.push(target.to_string());
+        self.arrived.1.notify_all();
+        let (arrived, timeout) = self
+            .arrived
+            .1
+            .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| {
+                PARALLEL_PAGES[..3]
+                    .iter()
+                    .any(|page| !arrived.iter().any(|seen| seen == page))
+            })
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "the three independent pages must run at the same time: {arrived:?}"
+        );
+    }
+}
+
+fn parallel_page_content(target: &str) -> String {
+    let title = target
+        .trim_start_matches("wiki/concepts/")
+        .trim_end_matches(".md");
+    format!("---\ntype: concept\nsources:\n  - 资料.md\n---\n# {title}\n\n> Sources: [资料](../sources/资料.md)\n")
+}
+
+impl ProcessRunner for ParallelPagesAgent {
+    fn find_executable(&self, command: &str) -> Option<PathBuf> {
+        SuccessfulAgent { delete_path: None }.find_executable(command)
+    }
+
+    fn run_with_timeout(
+        &self,
+        command: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<String, BackendError> {
+        SuccessfulAgent { delete_path: None }.run_with_timeout(command, args, timeout)
+    }
+
+    fn run_capture(&self, invocation: &AgentInvocation) -> Result<(String, String), BackendError> {
+        SuccessfulAgent { delete_path: None }.run_capture(invocation)
+    }
+
+    fn run_task_streaming(
+        &self,
+        invocation: &AgentInvocation,
+        _tasks: &TaskService,
+        _task_id: &str,
+    ) -> Result<String, BackendError> {
+        let prompt = invocation.stdin.as_deref().unwrap();
+        if !prompt.contains("--- Accepted CompilePlan ---") {
+            let items = PARALLEL_PAGES
+                .iter()
+                .enumerate()
+                .map(|(index, target)| CompilePlanItem {
+                    action: CompileAction::Create,
+                    target_path: target.to_string(),
+                    page_type: CompilePageType::Concept,
+                    source_ids: vec!["资料.md".into()],
+                    affected_existing_pages: if index == 3 {
+                        vec![PARALLEL_PAGES[0].to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    reason: "new evidence".into(),
+                    risk_flags: Vec::new(),
+                })
+                .collect();
+            return Ok(serde_json::to_string(&CompilePlan {
+                summary: "update wiki in parallel".into(),
+                items,
+                global_risk_flags: Vec::new(),
+                source_decisions: Vec::new(),
+            })
+            .unwrap());
+        }
+        let target = Self::requested_target(invocation).expect("one page per request");
+        self.prompts
+            .lock()
+            .unwrap()
+            .insert(target.clone(), prompt.to_string());
+        self.arrive_and_wait_for_batch(&target);
+        let content = match target.as_str() {
+            "wiki/index.md" => PARALLEL_PAGES
+                .iter()
+                .map(|page| format!("- [[{}]]\n", page.trim_start_matches("wiki/").trim_end_matches(".md")))
+                .fold("# Index\n".to_string(), |index, line| index + &line),
+            "wiki/overview.md" => "# Overview\nUpdated\n".to_string(),
+            page => parallel_page_content(page),
+        };
+        Ok(serde_json::json!({
+            "summary": "page",
+            "files": [{ "path": target, "content": content }],
+            "deletions": [],
+        })
+        .to_string())
+    }
+
+    fn run_task_streaming_isolated_abortable(
+        &self,
+        invocation: &AgentInvocation,
+        tasks: &TaskService,
+        task_id: &str,
+        _credential_agent: Option<AgentKind>,
+        _on_delta: &(dyn Fn(&str) + Sync),
+        _on_activity: &(dyn Fn(llm_wiki_desktop_lib::models::task::TaskActivity) + Sync),
+        abort: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, BackendError> {
+        use std::sync::atomic::Ordering;
+        let target = Self::requested_target(invocation).expect("one page per request");
+        self.abortable
+            .lock()
+            .unwrap()
+            .push((target.clone(), invocation.cwd.clone()));
+        let Some(fail_target) = self.fail_target else {
+            return self.run_task_streaming(invocation, tasks, task_id);
+        };
+        self.prompts
+            .lock()
+            .unwrap()
+            .insert(target.clone(), invocation.stdin.clone().unwrap());
+        self.arrive_and_wait_for_batch(&target);
+        if target == fail_target {
+            return Err(BackendError::new(
+                "AGENT_EXIT_FAILED",
+                "synthetic Agent failure",
+                true,
+                false,
+            ));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !abort.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a sibling of a failed page must be stopped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+        Err(BackendError::new(
+            "COMPILE_PAGE_BATCH_ABORTED",
+            "stopped because a sibling failed",
+            true,
+            false,
+        ))
+    }
+}
+
+// V8.1：生产路径（Update Wiki 工作流 → compile_service → AgentService）里，互不依赖的
+// 3 个派生页同批并行、各自在私有工作目录里走可中止调用；点名第 1 页的第 4 页留到下一批，
+// 读到第 1 页刚生成的候选；index/overview 在全部派生页之后两页并行；任务日志每页可对应。
+#[tokio::test]
+async fn independent_derived_pages_run_in_parallel_lanes_through_the_real_workflow() {
+    let (context, root) = project("parallel-pages");
+    GitService
+        .initialize_repository(&context, "initial")
+        .unwrap();
+    let (scope, _) = source_scope(&context);
+    let runner = Arc::new(ParallelPagesAgent::new(None));
+    let harness = UpdateHarness::new(runner.clone());
+    let run = enqueue_update(
+        &context,
+        &harness.tasks,
+        &harness.coordinator,
+        UpdateWikiMode::ChangedSources,
+        scope,
+    );
+    run_update_wiki(&context, run.clone(), &harness.services()).await;
+    let completed = harness.tasks.get_workflow_run(&run.task_id).unwrap();
+    assert_eq!(
+        completed.display_status,
+        WorkflowDisplayStatus::Completed,
+        "{:?}",
+        completed.error
+    );
+    for page in PARALLEL_PAGES {
+        assert_eq!(
+            fs::read_to_string(root.join(page)).unwrap(),
+            parallel_page_content(page)
+        );
+    }
+    let abortable = runner.abortable.lock().unwrap().clone();
+    assert_eq!(
+        abortable
+            .iter()
+            .map(|(target, _)| target.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            PARALLEL_PAGES[0],
+            PARALLEL_PAGES[1],
+            PARALLEL_PAGES[2],
+            "wiki/index.md",
+            "wiki/overview.md",
+        ]),
+        "the dependent fourth page runs alone, without a lane"
+    );
+    let owner = std::env::temp_dir().join("llm-wiki-desktop");
+    assert_eq!(
+        abortable
+            .iter()
+            .map(|(_, cwd)| cwd)
+            .collect::<HashSet<_>>()
+            .len(),
+        abortable.len(),
+        "every lane has its own private workspace"
+    );
+    for (target, cwd) in &abortable {
+        assert!(cwd.starts_with(&owner), "{target}: {}", cwd.display());
+        assert!(!cwd.exists(), "{target}: the private lease is removed");
+    }
+    let prompts = runner.prompts.lock().unwrap();
+    assert!(prompts[PARALLEL_PAGES[3]].contains(&format!(
+        "--- {}; current generated candidate",
+        PARALLEL_PAGES[0]
+    )));
+    let logs = harness
+        .tasks
+        .get_logs(&run.task_id)
+        .unwrap()
+        .into_iter()
+        .map(|line| line.message)
+        .collect::<Vec<_>>();
+    assert!(logs
+        .iter()
+        .any(|line| line.starts_with("Derived page parallelism: up to 3 page(s) per batch (LLM_WIKI_PAGE_PARALLELISM)")));
+    for (position, page) in PARALLEL_PAGES[..3].iter().enumerate() {
+        assert!(logs.iter().any(|line| line.starts_with(&format!(
+            "Page lane for {page}: parallel call {}/3 in this batch; isolated workspace ",
+            position + 1
+        ))));
+    }
+    for page in PARALLEL_PAGES {
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.starts_with(&format!("Page input for {page}: inline")))
+                .count(),
+            1,
+            "{page}: exactly one delivery/token line per page"
+        );
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+// V8.1：生产路径里一页失败，整组按原语义失败（报那一页真正的错误），同批其他调用收到
+// 中止信号被停下，后续的页和 index/overview 不再生成，正式 Wiki 不变，租约目录被删除。
+#[tokio::test]
+async fn a_failed_parallel_page_fails_the_update_and_stops_its_siblings() {
+    let (context, root) = project("parallel-page-failure");
+    GitService
+        .initialize_repository(&context, "initial")
+        .unwrap();
+    let before = CompileService::snapshot_wiki(&context).unwrap();
+    let (scope, _) = source_scope(&context);
+    let runner = Arc::new(ParallelPagesAgent::new(Some(PARALLEL_PAGES[1])));
+    let harness = UpdateHarness::new(runner.clone());
+    let run = enqueue_update(
+        &context,
+        &harness.tasks,
+        &harness.coordinator,
+        UpdateWikiMode::ChangedSources,
+        scope,
+    );
+    run_update_wiki(&context, run.clone(), &harness.services()).await;
+    let failed = harness.tasks.get_workflow_run(&run.task_id).unwrap();
+    assert_eq!(failed.display_status, WorkflowDisplayStatus::Failed);
+    assert_eq!(failed.error.as_ref().unwrap().code, "AGENT_EXIT_FAILED");
+    assert_eq!(
+        runner.stopped.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both siblings received the batch abort signal"
+    );
+    let abortable = runner.abortable.lock().unwrap().clone();
+    assert_eq!(
+        abortable
+            .iter()
+            .map(|(target, _)| target.as_str())
+            .collect::<HashSet<_>>(),
+        PARALLEL_PAGES[..3].iter().copied().collect::<HashSet<_>>()
+    );
+    assert!(abortable.iter().all(|(_, cwd)| !cwd.exists()));
+    let prompts = runner.prompts.lock().unwrap();
+    for later in [PARALLEL_PAGES[3], "wiki/index.md", "wiki/overview.md"] {
+        assert!(!prompts.contains_key(later), "{later} must not start after a failure");
+    }
+    assert_eq!(CompileService::snapshot_wiki(&context).unwrap(), before);
+    fs::remove_dir_all(root).ok();
+}

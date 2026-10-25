@@ -446,7 +446,22 @@ impl CompileService {
                             audit_path: Self::candidate_audit_path(context, task_id)?,
                         },
                         structural: agent_pages::StructuralPagePolicy::from_env(full_recompile),
+                        // V8.1：派生专题页每批并行路数（默认 3，环境变量可设 1~4，1 = 串行）。
+                        page_parallelism: agent_pages::page_parallelism_from_env(),
                     };
+                    // V8.1：记一行本次的并行设置，便于试跑时核对（只有数字）。
+                    services
+                        .task_service
+                        .append_log(
+                            task_id,
+                            LogLevel::Info,
+                            format!(
+                                "Derived page parallelism: up to {} page(s) per batch ({}); wiki/index.md and wiki/overview.md follow all derived pages.",
+                                options.page_parallelism,
+                                agent_pages::PAGE_PARALLELISM_ENV,
+                            ),
+                        )
+                        .map_err(task_operation_error)?;
                     let generated = agent_pages::generate_with_parallel_scaffolds_for_agent(
                         *agent,
                         &options,
@@ -464,6 +479,31 @@ impl CompileService {
                                     false,
                                 ));
                             }
+                            // V8.1：同批并行的另一页已经失败（整组注定失败），这一页不再启动。
+                            if call
+                                .parallel
+                                .is_some_and(|parallel| parallel.abort.load(std::sync::atomic::Ordering::SeqCst))
+                            {
+                                return Err(
+                                    crate::services::agent_service::page_batch_aborted_error(),
+                                );
+                            }
+                            // V8.1：这一页先前的并行结果被丢弃（同批前面的页改变了它的上下文，
+                            // 例如提出了新的删除），现在按串行时的上下文重新生成。单独记一行，
+                            // 解释同一页为什么出现两次 "Generating Wiki page"。
+                            if call.regenerated {
+                                services
+                                    .task_service
+                                    .append_log(
+                                        task_id,
+                                        LogLevel::Info,
+                                        format!(
+                                            "Page regeneration for {}: its parallel result was discarded because an earlier page in the same batch changed its context (for example by proposing deletions); it is regenerated with the serial context.",
+                                            call.target,
+                                        ),
+                                    )
+                                    .map_err(task_operation_error)?;
+                            }
                             // V8：记一行"这一页的上下文怎么给的、初始输入估算多少 token"
                             // （只有计数，不含正文），便于试跑时核对分层是否生效。
                             services
@@ -479,6 +519,25 @@ impl CompileService {
                                     ),
                                 )
                                 .map_err(task_operation_error)?;
+                            // V8.1：并行的一路再记一行"第几路、共几路、在哪个私有工作目录里跑"。
+                            // 几路的 Agent 工具活动日志会交错出现，读文件类日志里带着这个目录，
+                            // 据此能对应回是哪一页。
+                            if let Some(parallel) = call.parallel {
+                                services
+                                    .task_service
+                                    .append_log(
+                                        task_id,
+                                        LogLevel::Info,
+                                        format!(
+                                            "Page lane for {}: parallel call {}/{} in this batch; isolated workspace {}",
+                                            call.target,
+                                            parallel.position,
+                                            parallel.batch_size,
+                                            invocation_workspace.display(),
+                                        ),
+                                    )
+                                    .map_err(task_operation_error)?;
+                            }
                             // V8（评审修正）：目标页走 PageEdits、但基线没能内联（整体文件模式）时
                             // 写一条警告：锚点要靠模型读文件，长行是否被截断尚未实测，截断会以
                             // "Page edit anchor is absent" 失败。最常见的原因是环境变量把窗口
@@ -517,6 +576,9 @@ impl CompileService {
                                     services.task_service,
                                     task_id,
                                     lane,
+                                    // V8.1：并行的一路带上同批中止信号，另一页失败时
+                                    // 这一路的子进程被终止；串行调用为 None。
+                                    call.parallel.map(|parallel| parallel.abort),
                                 )
                         },
                         |index, total, target| {

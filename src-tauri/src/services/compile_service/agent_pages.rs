@@ -29,8 +29,61 @@
 //!        只能给每个新派生页加一行导航、给每条本批新引用的来源加一条引用，不能再涨别的。
 //!        开启顺序：第二期瘦身已把真实知识库的 index/overview 降到约 10.2 万 / 4.7 万字符，
 //!        低于默认上限；没瘦身的库原文超过上限时会直接进入"只能加导航行"的状态。
+//!
+//! V8.1（派生专题页分批并行）：
+//!   * 做什么：派生页（index/overview/log 以外的目标页）按计划顺序分批，每批最多 N 路同时
+//!     调用模型（默认 3，环境变量 LLM_WIKI_PAGE_PARALLELISM 可设 1~4，设 1 就是原来的
+//!     严格串行）。index/overview 仍在全部派生页之后、两页并行；log.md 仍本地追加。
+//!   * 为什么：实测一组约 8.5 分钟里派生页串行占约 5 分钟（每页 1~1.5 分钟），并行后约
+//!     提速 1.5 倍。
+//!   * 复用：并行执行沿用 V8 index+overview 两页并行的那套机制（scoped 线程、每路私有
+//!     租约目录、lane = 目标页路径、按计划顺序收结果）；新增的只有"同批中止"信号：任何
+//!     一路失败或 panic 就置位，其余各路不再启动、已启动的子进程被终止（见
+//!     `run_parallel_batch`）。每路的租约、哈希防篡改、预算检查、PageEdits 解码都在
+//!     `complete_page_request` / `decode_page_fragment` 里按页独立完成。
+//!   * 与串行的差别和处理：串行时第 k 页的提示用"此前所有已生成的页和删除提议"，同批
+//!     并行时只能用"批开始前"的。逐页提示里用到已生成内容的只有两处：
+//!       1. affectedExistingPages 点名的相关页，若已生成就换成它的当前候选；
+//!       2. "Proposed deletions from earlier page fragments"（此前各页提出的删除）。
+//!     第 1 处由组批规则排除：点名了本批已收入页面的页放到下一批（`derived_batch_len`）。
+//!     第 2 处无法预知（任何派生页都可能提出删除），所以收结果时按计划顺序逐页核对：
+//!     用串行时它应看到的上下文重建请求，与实际发出的逐字节相同才接受；不同就丢弃它和
+//!     本批后面的结果，从它开始重新组批（见 `generate_with_executor`）。于是被接受的每
+//!     一页，提示都与串行时逐字节相同（前提是前面各页的模型输出相同），最终清单按计划
+//!     顺序收集，文件顺序和内容与串行一致。
+//!   * 对链接/一致性的影响：没有新增风险。同批其他页的正文在串行时本来也不进这一页的
+//!     提示（只有被点名的相关页才会，而它们不会同批）；锚点和断链检查照旧在整份清单上做。
+//!     代价只在少见情况：同批前面的页提出了新删除时，后面几页的调用作废重做。
 use super::*;
 use super::agent_budget::{self, AgentInputBudget, OversizeReason};
+use crate::services::agent_service::{page_batch_aborted_error, PAGE_BATCH_ABORTED};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// V8.1：一组内派生专题页并行生成的默认路数。
+///
+/// 为什么是 3：一组最多 5 条来源，计划里通常 3~6 个派生页，3 路大约两轮就能跑完；
+/// 再多受 Agent 账号的并发和限流影响，收益递减，而一页失败时被连带作废的调用也更多。
+pub(super) const DEFAULT_PAGE_PARALLELISM: usize = 3;
+
+/// 并行路数允许的范围；超出范围（或不是整数）视为写错，回退默认值。
+/// 1 等于原来的严格串行；上限 4 防止误设很大的数一次拉起大量 Agent 进程。
+const MIN_PAGE_PARALLELISM: usize = 1;
+const MAX_PAGE_PARALLELISM: usize = 4;
+
+/// 覆盖派生页并行路数的环境变量（由启动后端的脚本传给后端进程本身），不必重新编译。
+pub(super) const PAGE_PARALLELISM_ENV: &str = "LLM_WIKI_PAGE_PARALLELISM";
+
+/// 生产入口：读环境变量得到派生页并行路数（写错回退默认 3）。
+pub(super) fn page_parallelism_from_env() -> usize {
+    parse_page_parallelism(std::env::var(PAGE_PARALLELISM_ENV).ok().as_deref())
+}
+
+/// 解析并行路数：去掉首尾空白后必须是 1~4 的整数，否则回退默认值。
+fn parse_page_parallelism(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (MIN_PAGE_PARALLELISM..=MAX_PAGE_PARALLELISM).contains(value))
+        .unwrap_or(DEFAULT_PAGE_PARALLELISM)
+}
 
 /// 结构页（index.md、overview.md）每批允许增长的基数（Unicode 字符数），也就是本批只选了
 /// 1 条来源时的增量上限。
@@ -123,11 +176,13 @@ pub(super) struct CandidateGenerationOptions {
     pub(super) audit: CandidateAuditTarget,
     /// index.md / overview.md 的体积规则（每批增量 + 绝对上限）。
     pub(super) structural: StructuralPagePolicy,
+    /// V8.1：派生专题页每批最多同时生成几页（1~4；1 = 原来的严格串行）。
+    pub(super) page_parallelism: usize,
 }
 
 impl CandidateGenerationOptions {
     /// 测试入口用的固定设置：固定任务编号和时间（保证串行/并行两次生成逐字节相同），
-    /// 结构页规则用默认常量（不读环境变量，测试结果稳定）。
+    /// 结构页规则和并行路数用默认常量（不读环境变量，测试结果稳定）。
     fn for_tests() -> Self {
         Self {
             audit: CandidateAuditTarget {
@@ -136,6 +191,7 @@ impl CandidateGenerationOptions {
                 audit_path: ".app/compile-audit/test-compile-task.json".into(),
             },
             structural: StructuralPagePolicy::defaults(false),
+            page_parallelism: DEFAULT_PAGE_PARALLELISM,
         }
     }
 }
@@ -429,10 +485,30 @@ pub(super) struct PageCall<'a> {
     /// 截断就会以 "Page edit anchor is absent" 失败。调用方据此在任务日志里写一条警告，
     /// 提示检查 LLM_WIKI_AGENT_CONTEXT_TOKENS 是不是把窗口设得比模型实际的小。
     pub(super) page_edits_baseline_in_file: Option<usize>,
+    /// V8.1：这一页在并行批里时的附加信息（位置、批大小、同批中止信号）；
+    /// 串行调用（批里只有这一页）为 None，行为与 V8 完全相同。
+    pub(super) parallel: Option<PageLane<'a>>,
+    /// V8.1：这一页先前的并行结果因同批前面的页改变了它的上下文（例如提出了新的删除）
+    /// 被丢弃，这次是按串行时的上下文重新生成。调用方据此在任务日志里注明，免得同一页
+    /// 出现两次 "Generating Wiki page" 让人困惑。
+    pub(super) regenerated: bool,
+}
+
+/// V8.1：并行批里一路调用的附加信息。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PageLane<'a> {
+    /// 这一页在本批里的位置（从 1 开始，按计划顺序）。
+    pub(super) position: usize,
+    /// 本批页数。
+    pub(super) batch_size: usize,
+    /// 同批共享的中止信号：任何一路失败（含 panic、线程启动失败）就置位；其余各路
+    /// 看到后不再启动，已启动的 Agent 子进程由进程 runner 终止。
+    pub(super) abort: &'a AtomicBool,
 }
 
 /// 串行入口（只在测试里用）：总是把完整内联提示交给 `complete`，与 V7 相同，
 /// 不模拟文件模式；文件模式由 `generate_with_parallel_scaffolds_with_budget` 覆盖。
+/// V8.1：它是测试里"串行基准"，所以派生页并行路数固定为 1。
 pub(super) fn generate(
     workspace: &Path,
     language: &str,
@@ -446,7 +522,10 @@ pub(super) fn generate(
         // 这里只影响请求里附带的文件模式（被忽略），用固定的 Codex 默认预算，
         // 不读环境变量，保证测试结果稳定。
         &AgentInputBudget::for_agent_with_overrides(AgentKind::Codex, None),
-        &CandidateGenerationOptions::for_tests(),
+        &CandidateGenerationOptions {
+            page_parallelism: 1,
+            ..CandidateGenerationOptions::for_tests()
+        },
         workspace,
         language,
         plan,
@@ -456,7 +535,10 @@ pub(super) fn generate(
         |requests| {
             requests
                 .iter()
-                .map(|request| complete(&request.prompt))
+                .map(|request| {
+                    complete(&request.prompt)
+                        .and_then(|raw| decode_page_fragment(workspace, &request.target, &raw))
+                })
                 .collect()
         },
         progress,
@@ -464,9 +546,11 @@ pub(super) fn generate(
     .map(|generated| generated.manifest)
 }
 
-// Only adjacent index/overview requests may overlap. Explicit self/baseline
-// context is independent; structural cross-page dependencies keep the plan serial.
+// Only adjacent index/overview requests may overlap among scaffolds. Explicit
+// self/baseline context is independent; structural cross-page dependencies keep
+// the plan serial.
 //
+// V8.1：派生页另按 `CandidateGenerationOptions::page_parallelism` 分批并行（测试设置为 3）。
 // 测试入口：固定用 Codex 的默认预算（不读环境变量），`complete` 不关心交付方式。
 pub(super) fn generate_with_parallel_scaffolds(
     workspace: &Path,
@@ -574,72 +658,174 @@ pub(super) fn generate_pages_with_options(
         parallel_scaffolds,
         |requests| {
             if requests.len() == 1 {
-                return complete_page_request(budget, workspace, &requests[0], None, &complete).map(|raw| vec![raw]);
+                // 批里只有一页：与 V8 的串行调用完全相同（候选工作区作 cwd、没有 lane、
+                // 没有中止信号）。并行路数设 1 时所有页都走这里。
+                let request = &requests[0];
+                return complete_page_request(budget, workspace, request, None, None, &complete)
+                    .and_then(|raw| decode_page_fragment(workspace, &request.target, &raw))
+                    .map(|fragment| vec![fragment]);
             }
-            if requests.len() != 2 {
+            if requests.is_empty() || requests.len() > MAX_PAGE_PARALLELISM {
                 return Err(invalid(
-                    "Only two independent scaffold requests may overlap.",
+                    "A parallel page batch must contain between two and four independent requests.",
                 ));
             }
-            std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                let mut spawn_error = None;
-                for request in requests {
-                    let complete = &complete;
-                    match std::thread::Builder::new()
-                        .name("wiki-scaffold".into())
-                        .spawn_scoped(scope, move || {
-                            let owner = std::env::temp_dir().join("llm-wiki-desktop");
-                            ensure_private_directory(&owner).map_err(|error| {
-                                io_error("COMPILE_INPUT_READ_FAILED", error, &owner)
-                            })?;
-                            let lease = tempfile::Builder::new()
-                                .prefix("compile-scaffold-")
-                                .tempdir_in(&owner)
-                                .map_err(|error| {
-                                    io_error("COMPILE_INPUT_READ_FAILED", error, &owner)
-                                })?;
-                            let wiki = lease.path().join("wiki");
-                            create_private_directory(&wiki).map_err(|error| {
-                                io_error("COMPILE_INPUT_READ_FAILED", error, &wiki)
-                            })?;
-                            complete_page_request(budget, lease.path(), request, Some(&request.target), complete)
-                        }) {
-                        Ok(handle) => handles.push(handle),
-                        Err(error) => {
-                            spawn_error = Some(BackendError::new(
-                                "COMPILE_AGENT_SPAWN_FAILED",
-                                error.to_string(),
-                                true,
-                                false,
-                            ));
-                            break;
-                        }
-                    }
-                }
-                // Join every started call before propagating any error. A
-                // sibling must never outlive candidate generation or its lease.
-                let results = handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle.join().unwrap_or_else(|_| {
-                            Err(BackendError::new(
-                                "COMPILE_AGENT_PANICKED",
-                                "A scaffold completion worker panicked.",
-                                true,
-                                false,
-                            ))
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(error) = spawn_error {
-                    return Err(error);
-                }
-                results.into_iter().collect()
-            })
+            run_parallel_batch(budget, workspace, requests, &complete)
         },
         progress,
     )
+}
+
+/// V8.1：同时运行一批互不依赖的页面请求（派生页一批最多 4 路，或 index+overview 两页），
+/// 返回按计划顺序排列的清单片段。沿用 V8 index+overview 两页并行的做法：scoped 线程、
+/// 每路一个私有租约目录、lane = 目标页路径；新增"同批中止"信号。
+///
+/// 失败语义（与串行相同：任何一页失败，整组失败，不产出部分候选）：
+///   * 任何一路返回错误或 panic，就置位中止信号；其余各路若还没启动就不再启动，正在跑的
+///     Agent 子进程由进程 runner 在等待循环里终止（`PAGE_BATCH_ABORTED`）。
+///   * 等所有线程都结束（各自的租约目录随之删除）才返回，任何一路都不会比本次生成活得久。
+///   * 返回按计划顺序第一个"真正的"错误；被连带停下的 `PAGE_BATCH_ABORTED` 只在找不到
+///     别的错误时才返回。
+///   * 任务取消时，各路的进程 runner 各自看到取消标记，终止各自的进程组。
+fn run_parallel_batch(
+    budget: &AgentInputBudget,
+    workspace: &Path,
+    requests: &[PageRequest],
+    complete: &(impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError> + Sync),
+) -> Result<Vec<CompileManifest>, BackendError> {
+    let abort = AtomicBool::new(false);
+    let batch_size = requests.len();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut spawn_error = None;
+        for (offset, request) in requests.iter().enumerate() {
+            let abort = &abort;
+            let lane = PageLane { position: offset + 1, batch_size, abort };
+            match std::thread::Builder::new()
+                .name("wiki-page-lane".into())
+                .spawn_scoped(scope, move || {
+                    // 这一路以错误返回或 panic 退出时，守卫在析构时置位中止信号，
+                    // 让同批其他路尽快停下；成功时解除，不影响别人。
+                    let mut guard = AbortSiblingsOnFailure { abort, succeeded: false };
+                    let result = run_page_lane(budget, workspace, request, lane, complete);
+                    guard.succeeded = result.is_ok();
+                    result
+                }) {
+                Ok(handle) => handles.push((request, handle)),
+                Err(error) => {
+                    // 线程都没起来：已启动的各路也要停下，整组失败。
+                    abort.store(true, AtomicOrdering::SeqCst);
+                    spawn_error = Some(BackendError::new(
+                        "COMPILE_AGENT_SPAWN_FAILED",
+                        error.to_string(),
+                        true,
+                        false,
+                    ));
+                    break;
+                }
+            }
+        }
+        // Join every started call before propagating any error. A
+        // sibling must never outlive candidate generation or its lease.
+        let results = handles
+            .into_iter()
+            .map(|(request, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(BackendError::new(
+                        "COMPILE_AGENT_PANICKED",
+                        if is_structural_page(&request.target) {
+                            "A scaffold completion worker panicked."
+                        } else {
+                            "A page completion worker panicked."
+                        },
+                        true,
+                        false,
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(error) = spawn_error {
+            return Err(error);
+        }
+        batch_outcome(results)
+    })
+}
+
+/// V8.1：并行批里的一路：私有租约目录（空的 wiki/）作工作目录，按页独立完成预算检查、
+/// 文件模式的租约与哈希防篡改（`complete_page_request`），再就地解码和逐页检查
+/// （`decode_page_fragment`），坏响应能立刻触发同批中止，不必等其他页跑完。
+fn run_page_lane(
+    budget: &AgentInputBudget,
+    workspace: &Path,
+    request: &PageRequest,
+    lane: PageLane<'_>,
+    complete: &(impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError> + Sync),
+) -> Result<CompileManifest, BackendError> {
+    // 同批另一路已经失败：连租约都不必建。
+    if lane.abort.load(AtomicOrdering::SeqCst) {
+        return Err(page_batch_aborted_error());
+    }
+    let owner = std::env::temp_dir().join("llm-wiki-desktop");
+    ensure_private_directory(&owner)
+        .map_err(|error| io_error("COMPILE_INPUT_READ_FAILED", error, &owner))?;
+    // 前缀只为排查时好认：结构页沿用 V8 的 compile-scaffold-，派生页用 compile-page-。
+    let lease = tempfile::Builder::new()
+        .prefix(if is_structural_page(&request.target) {
+            "compile-scaffold-"
+        } else {
+            "compile-page-"
+        })
+        .tempdir_in(&owner)
+        .map_err(|error| io_error("COMPILE_INPUT_READ_FAILED", error, &owner))?;
+    let wiki = lease.path().join("wiki");
+    create_private_directory(&wiki)
+        .map_err(|error| io_error("COMPILE_INPUT_READ_FAILED", error, &wiki))?;
+    let raw = complete_page_request(
+        budget,
+        lease.path(),
+        request,
+        Some(&request.target),
+        Some(lane),
+        complete,
+    )?;
+    // 解码对着候选工作区里的原文基线（PageEdits），不是租约目录。
+    decode_page_fragment(workspace, &request.target, &raw)
+    // `lease` 在这里析构：无论成功、失败还是被中止，租约目录都会被删除。
+}
+
+/// V8.1：析构时（含 panic 展开）若这一路没有成功，就置位同批中止信号。
+struct AbortSiblingsOnFailure<'a> {
+    abort: &'a AtomicBool,
+    succeeded: bool,
+}
+
+impl Drop for AbortSiblingsOnFailure<'_> {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.abort.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+}
+
+/// V8.1：汇总一批的结果。全部成功时按计划顺序（不是完成先后）返回片段；有失败时整组
+/// 失败，返回按计划顺序第一个不是"被连带停下"的错误。
+fn batch_outcome(
+    results: Vec<Result<CompileManifest, BackendError>>,
+) -> Result<Vec<CompileManifest>, BackendError> {
+    if results.iter().all(Result::is_ok) {
+        return results.into_iter().collect();
+    }
+    let mut aborted = None;
+    for result in results {
+        match result {
+            Err(error) if error.code == PAGE_BATCH_ABORTED => {
+                aborted.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+    }
+    Err(aborted.unwrap_or_else(page_batch_aborted_error))
 }
 
 struct PageRequest {
@@ -649,10 +835,23 @@ struct PageRequest {
     prompt: String,
     /// 文件模式（分层或整体）的最终提示和 generation-request.md 内容；None 表示内联。
     file_mode: Option<FileModeRequest>,
+    /// V8.1：这一页先前的并行结果被丢弃、这次重新生成（只影响任务日志，不进提示）。
+    regenerated: bool,
+}
+
+impl PageRequest {
+    /// V8.1：两份请求发给模型的输入是否逐字节相同（目标页、内联提示、文件模式的提示和
+    /// generation-request.md 内容）。`regenerated` 只是日志标记，不参与比较。
+    fn same_input(&self, other: &PageRequest) -> bool {
+        self.target == other.target
+            && self.prompt == other.prompt
+            && self.file_mode == other.file_mode
+    }
 }
 
 /// 文件模式请求：`prompt` 是真正发给模型的提示，`context` 写进租约目录的
 /// generation-request.md（提示里带着它的字节数和 SHA-256，调用结束后再核对一次）。
+#[derive(PartialEq, Eq)]
 struct FileModeRequest {
     transport: PageTransportKind,
     prompt: String,
@@ -664,11 +863,14 @@ struct FileModeRequest {
 // Read-only context is kept complete in a private per-call lease, including
 // generated-page overlays. V8：Claude 和 Codex 都具备只读文件工具，都可以走文件模式；
 // 交付方式已由 page_request 按预算决定，这里只负责执行和防篡改校验。
+// V8.1：并行时每一路各自调用这里，所以预算检查、租约目录、哈希核对都按页独立；
+// `parallel` 原样交给调用方（串行为 None）。
 fn complete_page_request(
     budget: &AgentInputBudget,
     workspace: &Path,
     request: &PageRequest,
     lane: Option<&str>,
+    parallel: Option<PageLane<'_>>,
     complete: &impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError>,
 ) -> Result<String, BackendError> {
     let Some(file_mode) = &request.file_mode else {
@@ -680,6 +882,8 @@ fn complete_page_request(
                 target: &request.target,
                 transport: PageTransportKind::Inline,
                 page_edits_baseline_in_file: None,
+                parallel,
+                regenerated: request.regenerated,
             },
         );
     };
@@ -736,6 +940,8 @@ fn complete_page_request(
             target: &request.target,
             transport: file_mode.transport,
             page_edits_baseline_in_file: file_mode.page_edits_baseline_in_file,
+            parallel,
+            regenerated: request.regenerated,
         },
     );
     let after = std::fs::read(&file).map_err(|e| io_error("COMPILE_INPUT_READ_FAILED", e, &file))?;
@@ -800,7 +1006,12 @@ fn page_request(
     };
     // 完整内联提示（与 V7 逐字节相同）。
     let prompt = build(PageContextMode::Inline)?.inline;
-    let inline = |prompt: String| PageRequest { target: target.to_string(), prompt, file_mode: None };
+    let inline = |prompt: String| PageRequest {
+        target: target.to_string(),
+        prompt,
+        file_mode: None,
+        regenerated: false,
+    };
     // 1. 没有只读工具的 Agent 只能内联；完整提示不超过内联阈值的也照旧内联（小知识库不变）。
     if !budget.read_only_tools || budget.fits_inline(&prompt) {
         return Ok(inline(prompt));
@@ -829,6 +1040,7 @@ fn page_request(
                     context: layered.reference,
                     page_edits_baseline_in_file: None,
                 }),
+                regenerated: false,
             });
         }
     }
@@ -848,7 +1060,77 @@ fn page_request(
             context,
             page_edits_baseline_in_file,
         }),
+        regenerated: false,
     })
+}
+
+/// V8.1：从 `start`（一个派生页）开始，按计划顺序组一批派生页，最多 `parallelism` 页。
+///
+/// 遇到下面任一情况就在那一页之前截断，让它留到下一批：
+///   * 结构页：index/overview/log 排在所有派生页之后，单独处理；
+///   * 它的 affectedExistingPages 点名了本批已收入的页：串行时它的提示里会附上那一页
+///     刚生成的候选（"current generated candidate, supersedes the baseline"），同批并行
+///     就看不到；那一页若是本次新建的页，原文都不存在，组提示时读取还会直接失败。
+///     路径按原样比较，与 `page_prompt_parts` 查找已生成候选时的规则一致。
+///
+/// 反方向（前面的页点名后面的页）不用截断：串行时前面的页本来也只能看到后面那页的原文。
+fn derived_batch_len(
+    plan: &CompilePlan,
+    targets: &[String],
+    start: usize,
+    parallelism: usize,
+) -> usize {
+    let limit = parallelism.clamp(MIN_PAGE_PARALLELISM, MAX_PAGE_PARALLELISM);
+    let mut end = start + 1;
+    while end < targets.len() && end - start < limit {
+        let candidate = &targets[end];
+        if is_structural_page(candidate) {
+            break;
+        }
+        let reads_batch_page = plan
+            .items
+            .iter()
+            .find(|item| item.target_path == *candidate)
+            .is_some_and(|item| {
+                item.affected_existing_pages
+                    .iter()
+                    .any(|path| targets[start..end].contains(path))
+            });
+        if reads_batch_page {
+            break;
+        }
+        end += 1;
+    }
+    end - start
+}
+
+/// 把一页的模型输出解码成只含这一页的清单片段，并做与其他页无关的逐页检查：
+/// PageEdits 解码（大页）或整页 JSON、必须正好是请求的目标页、删除提议不能重复。
+///
+/// V8.1：从主循环里原样挪出来，检查规则和错误信息不变；并行时在各路线程里就地执行，
+/// 坏响应能立刻触发同批中止。依赖前后页的检查（结构页不得新增删除、结构页体积闸门）
+/// 仍在主循环里按计划顺序做。
+fn decode_page_fragment(
+    workspace: &Path,
+    target: &str,
+    raw: &str,
+) -> Result<CompileManifest, BackendError> {
+    let fragment: CompileManifest = if let Some(baseline) = large_page_baseline(workspace, target)? {
+        decode_page_edits(target, &baseline, raw)?
+    } else {
+        serde_json::from_str(extract_json_object(raw, "COMPILE_OUTPUT_INVALID")?)
+            .map_err(|error| invalid(&error.to_string()))?
+    };
+    if fragment.files.len() != 1 || fragment.files[0].path != target {
+        return Err(invalid("Agent page response must contain exactly its requested target.")
+        .with_details(serde_json::json!({"expectedTarget": target,
+            "returnedTargets": fragment.files.iter().map(|file| &file.path).collect::<Vec<_>>() })));
+    }
+    let unique = fragment.deletions.iter().collect::<HashSet<_>>();
+    if unique.len() != fragment.deletions.len() {
+        return Err(invalid("Agent page response contains duplicate deletions."));
+    }
+    Ok(fragment)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -861,7 +1143,9 @@ fn generate_with_executor(
     sources: &[ResolvedCompileSource],
     dependencies: &[crate::models::compile::CompileSourceDependency],
     parallel_scaffolds: bool,
-    mut complete: impl FnMut(&[PageRequest]) -> Result<Vec<String>, BackendError>,
+    // V8.1：执行一批请求，返回按计划顺序排列、已逐页解码检查过的清单片段
+    // （`decode_page_fragment`）；V8 返回的是原始响应文本，解码在主循环里做。
+    mut complete: impl FnMut(&[PageRequest]) -> Result<Vec<CompileManifest>, BackendError>,
     mut progress: impl FnMut(usize, usize, &str) -> Result<(), BackendError>,
 ) -> Result<GeneratedPages, BackendError> {
     let mut targets = plan
@@ -880,6 +1164,8 @@ fn generate_with_executor(
     let mut deletions = std::collections::BTreeSet::new();
     // V8：log.md 由后端本地追加时同时产出完整审计记录（targets 去重后 log.md 恰好一次）。
     let mut audit = None;
+    // V8.1：并行结果被判定为过时、需要按串行上下文重新生成的页（只用于任务日志标注）。
+    let mut regenerated = HashSet::new();
     let mut index = 0;
     while index < targets.len() {
         let target = &targets[index];
@@ -905,9 +1191,14 @@ fn generate_with_executor(
             && targets.get(index + 1).map(String::as_str) == Some("wiki/overview.md")
         {
             2
+        } else if !is_structural_page(target) {
+            // V8.1：派生页按计划顺序分批并行（规则见 `derived_batch_len`）；
+            // 并行路数为 1 时每批只有一页，与原来的串行完全相同。
+            derived_batch_len(plan, &targets, index, options.page_parallelism)
         } else {
             1
         };
+        // V8.1：一批里每页的提示都用"批开始前"的上下文（`files`、`deletions`）构造。
         let requests = targets[index..index + count]
             .iter()
             .enumerate()
@@ -915,34 +1206,39 @@ fn generate_with_executor(
                 progress(index + offset + 1, targets.len(), target)?;
                 // V8：按该 Agent 的预算决定内联、分层还是整体文件模式
                 // （V7 这里不管实际用哪个 Agent，都按 Codex 的字符上限判断）。
-                page_request(
+                let mut request = page_request(
                     budget, &options.structural, workspace, language, plan, target,
                     sources, dependencies, &files, &deletions,
-                )
+                )?;
+                request.regenerated = regenerated.contains(target);
+                Ok(request)
             })
             .collect::<Result<Vec<_>, BackendError>>()?;
-        let responses = complete(&requests)?;
-        if responses.len() != requests.len() {
+        let fragments = complete(&requests)?;
+        if fragments.len() != requests.len() {
             return Err(invalid(
                 "Agent completion count does not match the requested page batch.",
             ));
         }
-        for (request, raw) in requests.iter().zip(responses) {
+        // V8.1：按计划顺序（不是完成先后）逐页接受；`accepted` 记本批实际接受了几页。
+        let mut accepted = 0;
+        for (position, (request, fragment)) in requests.iter().zip(fragments).enumerate() {
             let target = &request.target;
-            let fragment: CompileManifest = if let Some(baseline) = large_page_baseline(workspace, target)? {
-                decode_page_edits(target, &baseline, &raw)?
-            } else {
-                serde_json::from_str(extract_json_object(&raw, "COMPILE_OUTPUT_INVALID")?)
-                    .map_err(|error| invalid(&error.to_string()))?
-            };
-            if fragment.files.len() != 1 || fragment.files[0].path != *target {
-                return Err(invalid("Agent page response must contain exactly its requested target.")
-                .with_details(serde_json::json!({"expectedTarget": target,
-                    "returnedTargets": fragment.files.iter().map(|file| &file.path).collect::<Vec<_>>() })));
-            }
-            let unique = fragment.deletions.iter().collect::<HashSet<_>>();
-            if unique.len() != fragment.deletions.len() {
-                return Err(invalid("Agent page response contains duplicate deletions."));
+            // V8.1 过时核对：批里第 2 页起，用串行时它应看到的上下文（此前所有已接受的页
+            // 和删除提议）重建请求；与实际发出的不完全相同（例如同批前面的页提出了新的
+            // 删除，串行时它的提示里会多出 "Proposed deletions from earlier page fragments"），
+            // 就丢弃它和本批后面的结果，下一轮从它开始重新组批。重新组批时它排第一，上下文
+            // 必然与串行相同、一定被接受，所以每轮至少前进一页，不会死循环。
+            // 第 1 页的上下文就是批开始前的上下文，与串行相同，不用核对。
+            if position > 0 {
+                let serial = page_request(
+                    budget, &options.structural, workspace, language, plan, target,
+                    sources, dependencies, &files, &deletions,
+                )?;
+                if !serial.same_input(request) {
+                    regenerated.extend(requests[position..].iter().map(|request| request.target.clone()));
+                    break;
+                }
             }
             if is_structural_page(target)
                 && fragment
@@ -967,8 +1263,9 @@ fn generate_with_executor(
             )?;
             deletions.extend(fragment.deletions);
             files.extend(fragment.files);
+            accepted += 1;
         }
-        index += count;
+        index += accepted;
     }
     let manifest = CompileManifest {
         files,
@@ -1897,6 +2194,7 @@ mod tests {
                 context,
                 page_edits_baseline_in_file: None,
             }),
+            regenerated: false,
         }
     }
 
@@ -1948,7 +2246,7 @@ mod tests {
         ] {
             let request = request_for(&budget);
             let lease = std::sync::Mutex::new(None);
-            let out = complete_page_request(&budget, root.path(), &request, None, &|cwd, prompt, lane, call| {
+            let out = complete_page_request(&budget, root.path(), &request, None, None, &|cwd, prompt, lane, call| {
                 assert!(lane.is_none());
                 assert_eq!(call.target, target);
                 assert_eq!(call.transport, expected, "{agent:?}");
@@ -1975,7 +2273,7 @@ mod tests {
             }
         }
         // 兜底：没有只读工具的 Agent 拿到文件模式请求时直接拒绝，绝不启动调用或悄悄降级。
-        let error = complete_page_request(&default_budget(AgentKind::Hermes), root.path(), &claude_request, None,
+        let error = complete_page_request(&default_budget(AgentKind::Hermes), root.path(), &claude_request, None, None,
             &|_, _, _, _| panic!("no Agent process may launch")).unwrap_err();
         assert_eq!(error.code, "AGENT_OPERATION_PROTOCOL_UNSUPPORTED");
     }
@@ -2081,7 +2379,7 @@ mod tests {
         let default_request = page_request(&default_budget(AgentKind::Claude), &test_structural(), root.path(), "zh-CN", &plan, &target, &sources, &[], &[], &Default::default()).unwrap();
         assert!(default_request.file_mode.is_none());
         assert!(default_request.prompt.contains(&huge));
-        let out = complete_page_request(&claude, root.path(), &request, None, &|cwd, prompt, _, call| {
+        let out = complete_page_request(&claude, root.path(), &request, None, None, &|cwd, prompt, _, call| {
             assert_eq!(call.transport, PageTransportKind::WholeFile);
             assert_eq!(call.page_edits_baseline_in_file, Some(huge.len()));
             assert_eq!(prompt, file_mode.prompt);
@@ -2183,8 +2481,9 @@ mod tests {
                 context: "reference".into(),
                 page_edits_baseline_in_file: None,
             }),
+            regenerated: false,
         };
-        let error = complete_page_request(&default_budget(AgentKind::Claude), root.path(), &request, None,
+        let error = complete_page_request(&default_budget(AgentKind::Claude), root.path(), &request, None, None,
             &|_, _, _, _| panic!("no Agent process may launch")).unwrap_err();
         assert_eq!(error.code, "COMPILE_AGENT_INPUT_TOO_LARGE");
         assert!(!format!("{error:?}").contains("必需内容必需内容"), "errors carry counts, never prompt bodies");
@@ -2244,7 +2543,7 @@ mod tests {
         // Claude 和 Codex 走同一套哈希防篡改校验。
         for agent in [AgentKind::Codex, AgentKind::Claude] {
             let lease = std::sync::Mutex::new(None);
-            let error = complete_page_request(&default_budget(agent), root.path(), &request, None, &|cwd, _, _, call| {
+            let error = complete_page_request(&default_budget(agent), root.path(), &request, None, None, &|cwd, _, _, call| {
                 assert!(call.transport.needs_read_only_tools());
                 *lease.lock().unwrap() = Some(cwd.to_path_buf());
                 #[cfg(unix)] {
@@ -2267,7 +2566,7 @@ mod tests {
         let budget = default_budget(AgentKind::Codex);
         for code in ["AGENT_CANCELLED", "AGENT_EXIT_FAILED"] {
             let lease = std::sync::Mutex::new(None);
-            let error = complete_page_request(&budget, root.path(), &request, Some("lane"), &|cwd, _, lane, _| {
+            let error = complete_page_request(&budget, root.path(), &request, Some("lane"), None, &|cwd, _, lane, _| {
                 assert_eq!(lane, Some("lane"));
                 *lease.lock().unwrap() = Some(cwd.to_path_buf());
                 Err(BackendError::new(code, "synthetic failure", true, false))
@@ -2277,7 +2576,7 @@ mod tests {
         }
         let lease = std::sync::Mutex::new(None);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            complete_page_request(&budget, root.path(), &request, None, &|cwd, _, _, _| {
+            complete_page_request(&budget, root.path(), &request, None, None, &|cwd, _, _, _| {
                 *lease.lock().unwrap() = Some(cwd.to_path_buf());
                 panic!("synthetic completion panic")
             })
@@ -2639,6 +2938,419 @@ mod tests {
                 "# Existing log\nHistorical fact must survive."
             );
         }
+    }
+
+    // ---------------- V8.1：派生专题页分批并行 ----------------
+
+    /// V8.1 测试用：在 fixture 的计划上再加几个互不依赖的派生页（共 `count` 页，计划顺序
+    /// 就是编号顺序）。
+    fn independent_pages(count: usize) -> (tempfile::TempDir, CompilePlan, Vec<ResolvedCompileSource>) {
+        let (root, mut plan, sources) = fixture();
+        for page in 2..=count {
+            let mut item = plan.items[0].clone();
+            item.target_path = format!("wiki/concepts/并行页{page}.md");
+            plan.items.push(item);
+        }
+        (root, plan, sources)
+    }
+
+    /// V8.1 测试用：不提出删除的整页片段（没有删除提议，同批结果不会被判定为过时）。
+    fn plain_fragment(prompt: &str) -> String {
+        let target = requested_target(prompt);
+        serde_json::json!({"summary":"fragment","files":[{"path":target,"content":format!("# {target}\n正文😀")}],"deletions":[]}).to_string()
+    }
+
+    fn options_with_parallelism(page_parallelism: usize) -> CandidateGenerationOptions {
+        CandidateGenerationOptions { page_parallelism, ..CandidateGenerationOptions::for_tests() }
+    }
+
+    /// V8.1 测试用：按给定并行路数跑生产同款的逐页生成，`answer` 决定每页怎么回答。
+    /// 返回结果、每页最后一次发出的提示、进度回调收到的页序。
+    #[allow(clippy::type_complexity)]
+    fn run_with_parallelism(
+        page_parallelism: usize,
+        root: &Path,
+        plan: &CompilePlan,
+        sources: &[ResolvedCompileSource],
+        answer: impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError> + Sync,
+    ) -> (Result<GeneratedPages, BackendError>, std::collections::BTreeMap<String, String>, Vec<String>) {
+        let prompts = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let mut progress = Vec::new();
+        let result = generate_pages_with_options(
+            default_budget(AgentKind::Codex), &options_with_parallelism(page_parallelism), root, "zh-CN", plan, sources, &[],
+            |cwd, prompt, lane, call| {
+                prompts.lock().unwrap().insert(call.target.to_string(), prompt.to_string());
+                answer(cwd, prompt, lane, call)
+            },
+            |_, _, path| { progress.push(path.to_string()); Ok(()) },
+        );
+        (result, prompts.into_inner().unwrap(), progress)
+    }
+
+    // 要求：并行结果的顺序与串行一致——人为让同批里后提交的页先完成，最终清单（文件顺序、
+    // 内容）、审计记录、每页提示、进度顺序都与并行路数 1 的串行结果逐字节相同。
+    #[test]
+    fn parallel_derived_pages_keep_plan_order_when_later_pages_finish_first() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Condvar, Mutex};
+        let (root, plan, sources) = independent_pages(5);
+        let derived = plan.items.iter().map(|item| item.target_path.clone()).collect::<Vec<_>>();
+        let (serial, serial_prompts, serial_progress) =
+            run_with_parallelism(1, root.path(), &plan, &sources, |_, prompt, _, _| Ok(plain_fragment(prompt)));
+        let serial = serial.unwrap();
+
+        let arrived = (Mutex::new(Vec::<String>::new()), Condvar::new());
+        let completed = (Mutex::new(Vec::<String>::new()), Condvar::new());
+        let lanes = Mutex::new(Vec::new());
+        let leases = Mutex::new(Vec::new());
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let (parallel, parallel_prompts, parallel_progress) =
+            run_with_parallelism(3, root.path(), &plan, &sources, |cwd, prompt, lane, call| {
+                let target = requested_target(prompt);
+                assert_eq!(call.target, target);
+                assert!(!call.regenerated);
+                if is_structural_page(target) {
+                    return Ok(plain_fragment(prompt));
+                }
+                let parallel = call.parallel.expect("independent derived pages run in parallel lanes");
+                assert_eq!(lane, Some(target), "the lane is the page path");
+                assert_ne!(cwd, root.path());
+                assert!(cwd.starts_with(std::env::temp_dir().join("llm-wiki-desktop")));
+                lanes.lock().unwrap().push((target.to_string(), parallel.position, parallel.batch_size));
+                leases.lock().unwrap().push(cwd.to_path_buf());
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                let at = derived.iter().position(|path| path == target).unwrap();
+                // 先等同批各页都已开始（证明它们确实同时在跑）……
+                let first = at + 1 - parallel.position;
+                let members = derived[first..first + parallel.batch_size].to_vec();
+                {
+                    let mut started = arrived.0.lock().unwrap();
+                    started.push(target.to_string());
+                    arrived.1.notify_all();
+                    let (_started, timeout) = arrived.1.wait_timeout_while(started, std::time::Duration::from_secs(5),
+                        |started| members.iter().any(|path| !started.contains(path))).unwrap();
+                    assert!(!timeout.timed_out(), "every page of the batch must start before any finishes");
+                }
+                // ……再等同批里排在后面的页全部完成，这一页才完成：完成顺序与提交顺序相反。
+                let later = derived[at + 1..first + parallel.batch_size].to_vec();
+                let done = completed.0.lock().unwrap();
+                let (mut done, timeout) = completed.1.wait_timeout_while(done, std::time::Duration::from_secs(5),
+                    |done| later.iter().any(|path| !done.contains(path))).unwrap();
+                assert!(!timeout.timed_out(), "later pages of the batch must run at the same time and finish first");
+                active.fetch_sub(1, Ordering::SeqCst);
+                done.push(target.to_string());
+                completed.1.notify_all();
+                Ok(plain_fragment(prompt))
+            });
+        let parallel = parallel.unwrap();
+        let order = |indexes: &[usize]| indexes.iter().map(|&i| derived[i].clone()).collect::<Vec<_>>();
+        assert_eq!(*completed.0.lock().unwrap(), order(&[2, 1, 0, 4, 3]), "later submissions finished first");
+        assert_eq!(peak.load(Ordering::SeqCst), 3, "at most three derived pages run at once");
+        assert_eq!(lanes.lock().unwrap().iter().cloned().collect::<std::collections::BTreeSet<_>>(),
+            [(0, 1, 3), (1, 2, 3), (2, 3, 3), (3, 1, 2), (4, 2, 2)].iter()
+                .map(|&(i, position, size)| (derived[i].clone(), position, size)).collect::<std::collections::BTreeSet<_>>());
+        // 文件顺序、内容、删除、摘要、log.md 摘要和审计记录逐字节相同。
+        assert_eq!(serde_json::to_string(&parallel.manifest).unwrap(), serde_json::to_string(&serial.manifest).unwrap());
+        assert_eq!(parallel.audit.content, serial.audit.content);
+        assert_eq!(parallel.manifest.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+            derived.iter().cloned().chain(["wiki/index.md", "wiki/overview.md", "wiki/log.md"].map(String::from)).collect::<Vec<_>>());
+        assert_eq!(parallel_prompts, serial_prompts, "every page prompt equals its serial prompt");
+        assert_eq!(parallel_progress, serial_progress);
+        let leases = leases.into_inner().unwrap();
+        assert_eq!(leases.iter().collect::<HashSet<_>>().len(), 5, "every lane has its own private lease");
+        assert!(leases.iter().all(|path| !path.exists()), "every lease is removed");
+    }
+
+    // 要求：并行路数为 1 时与原来的串行逐字节一致——派生页逐页调用（没有 lane、没有中止
+    // 信号、候选工作区作 cwd、同一时刻只有一页），提示序列、最终清单与 V7 串行入口相同。
+    #[test]
+    fn page_parallelism_one_is_byte_identical_to_serial_generation() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex};
+        let (root, plan, sources) = independent_pages(4);
+        std::fs::write(root.path().join("wiki/concepts/obsolete.md"), "# Old").unwrap();
+        // 串行基准：`generate` 每页都提出删除（`fragment`），覆盖"此前删除提议"进入后续提示。
+        let mut expected = Vec::new();
+        let serial = generate(root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
+            expected.push(prompt.to_string());
+            Ok(fragment(prompt))
+        }, |_, _, _| Ok(())).unwrap();
+        let derived_prompts = |prompts: &[String]| prompts.iter()
+            .filter(|prompt| !is_structural_page(requested_target(prompt))).cloned().collect::<Vec<_>>();
+        let observed = Mutex::new(Vec::new());
+        let active = AtomicUsize::new(0);
+        let (generated, _, _) = run_with_parallelism(1, root.path(), &plan, &sources, |cwd, prompt, lane, call| {
+            if !is_structural_page(call.target) {
+                assert!(lane.is_none() && call.parallel.is_none() && !call.regenerated);
+                assert_eq!(cwd, root.path());
+                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0, "derived pages stay strictly serial");
+                observed.lock().unwrap().push(prompt.to_string());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(fragment(prompt))
+        });
+        assert_eq!(observed.into_inner().unwrap(), derived_prompts(&expected));
+        assert_eq!(serde_json::to_string(&generated.unwrap().manifest).unwrap(), serde_json::to_string(&serial).unwrap());
+    }
+
+    // 要求：一页失败时整组失败、同批其他调用被取消、租约目录清理干净。分别模拟 Agent 报错、
+    // 返回坏 JSON（在该路线程里就地解码失败）、线程 panic；失败页排在批中间，验证报的是
+    // 它真正的错误，而不是计划顺序更靠前、被连带停下的那一页。
+    #[test]
+    fn one_failed_page_fails_the_group_stops_siblings_and_cleans_leases() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Condvar, Mutex};
+        for (failure, expected_code) in [("agent", "AGENT_EXIT_FAILED"), ("json", "COMPILE_OUTPUT_INVALID"), ("panic", "COMPILE_AGENT_PANICKED")] {
+            let (root, plan, sources) = independent_pages(3);
+            let failing = plan.items[1].target_path.clone();
+            let arrived = (Mutex::new(0_usize), Condvar::new());
+            let stopped = AtomicUsize::new(0);
+            let calls = AtomicUsize::new(0);
+            let leases = Mutex::new(Vec::new());
+            let started = std::time::Instant::now();
+            let (result, _, _) = run_with_parallelism(3, root.path(), &plan, &sources, |cwd, prompt, _, call| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                leases.lock().unwrap().push(cwd.to_path_buf());
+                let parallel = call.parallel.expect("the three pages share one batch");
+                {
+                    let mut count = arrived.0.lock().unwrap();
+                    *count += 1;
+                    arrived.1.notify_all();
+                    let (count, timeout) = arrived.1.wait_timeout_while(count, std::time::Duration::from_secs(5), |count| *count < 3).unwrap();
+                    assert!(!timeout.timed_out() && *count == 3);
+                }
+                if call.target == failing {
+                    match failure {
+                        "agent" => return Err(BackendError::new("AGENT_EXIT_FAILED", "synthetic Agent failure", true, false)),
+                        "json" => return Ok("not a page fragment".into()),
+                        _ => panic!("synthetic page worker panic"),
+                    }
+                }
+                // 模拟进程 runner：等到同批中止信号，像真实 runner 一样终止并报连带错误。
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !parallel.abort.load(AtomicOrdering::SeqCst) {
+                    assert!(std::time::Instant::now() < deadline, "the sibling must be stopped, not left running");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                stopped.fetch_add(1, Ordering::SeqCst);
+                let _ = prompt;
+                Err(page_batch_aborted_error())
+            });
+            let error = result.unwrap_err();
+            assert_eq!(error.code, expected_code, "{failure}");
+            assert_eq!(stopped.load(Ordering::SeqCst), 2, "both siblings were stopped ({failure})");
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "no later page or scaffold starts after a failure ({failure})");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4), "siblings are stopped promptly ({failure})");
+            let leases = leases.into_inner().unwrap();
+            assert_eq!(leases.len(), 3);
+            assert!(leases.iter().all(|path| !path.exists()), "every lease is removed ({failure})");
+            for item in &plan.items {
+                assert!(!root.path().join(&item.target_path).exists(), "no partial page is written ({failure})");
+            }
+            assert_eq!(std::fs::read_to_string(root.path().join("wiki/log.md")).unwrap(),
+                "# Existing log\nHistorical fact must survive.");
+        }
+    }
+
+    /// V8.1 测试用：文件模式（分层）请求，上下文写进各自租约的 generation-request.md。
+    fn file_mode_request(target: &str, context: &str) -> PageRequest {
+        PageRequest {
+            target: target.into(),
+            prompt: format!("Generate only `{target}`.\ninline"),
+            file_mode: Some(FileModeRequest {
+                transport: PageTransportKind::Layered,
+                prompt: format!("Generate only `{target}`.\nread generation-request.md ({} bytes, SHA-256 {})", context.len(), hash_bytes(context.as_bytes())),
+                context: context.into(),
+                page_edits_baseline_in_file: None,
+            }),
+            regenerated: false,
+        }
+    }
+
+    // 要求：每路调用的哈希防篡改与预算检查按页独立且仍然生效——每路有自己的租约和
+    // generation-request.md；一路篡改自己的文件或超出预算，只让这一路报原来的错误，
+    // 同批其他路被停下，所有租约都被删除。
+    #[test]
+    fn parallel_lanes_keep_independent_budget_and_tamper_checks() {
+        use std::sync::Mutex;
+        let root = tempfile::tempdir().unwrap();
+        let budget = default_budget(AgentKind::Claude);
+        let targets = ["wiki/concepts/甲.md", "wiki/concepts/乙.md", "wiki/concepts/丙.md"];
+        let context_of = |target: &str| format!("# read-only context for {target}\n{}", "参考😀".repeat(500));
+        // 1) 全部成功：每路读到的正好是自己那一页的上下文，结果按计划顺序返回。
+        for mode in ["ok", "tamper", "budget"] {
+            let mut requests = targets.iter().map(|target| file_mode_request(target, &context_of(target))).collect::<Vec<_>>();
+            if mode == "budget" {
+                // 与 file_mode_prompt_over_the_hard_limit_fails_before_any_agent_launch 相同的超限提示。
+                requests[1].file_mode.as_mut().unwrap().prompt = "必需内容".repeat(100_000);
+            }
+            let leases = Mutex::new(Vec::new());
+            let called = Mutex::new(Vec::new());
+            let result = run_parallel_batch(&budget, root.path(), &requests, &|cwd, prompt, lane, call| {
+                assert_eq!(lane, Some(call.target));
+                assert!(call.transport.needs_read_only_tools());
+                called.lock().unwrap().push(call.target.to_string());
+                leases.lock().unwrap().push(cwd.to_path_buf());
+                let file = cwd.join("generation-request.md");
+                let context = std::fs::read_to_string(&file).unwrap();
+                assert_eq!(context, context_of(call.target), "each lane reads only its own context");
+                assert!(prompt.contains(&hash_bytes(context.as_bytes())));
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(std::fs::metadata(cwd).unwrap().permissions().mode() & 0o077, 0);
+                    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o077, 0);
+                }
+                let parallel = call.parallel.unwrap();
+                if mode == "tamper" && parallel.position == 2 {
+                    std::fs::write(&file, "tampered").unwrap();
+                    return Ok(plain_fragment(prompt));
+                }
+                if mode != "ok" {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !parallel.abort.load(AtomicOrdering::SeqCst) {
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    // 被停下的路自己的文件没有被别人动过。
+                    assert_eq!(std::fs::read_to_string(&file).unwrap(), context_of(call.target));
+                    return Err(page_batch_aborted_error());
+                }
+                Ok(plain_fragment(prompt))
+            });
+            let leases = leases.into_inner().unwrap();
+            assert!(leases.iter().all(|path| !path.exists()), "{mode}: every lease is removed");
+            match mode {
+                "ok" => {
+                    let fragments = result.unwrap();
+                    assert_eq!(fragments.iter().map(|fragment| fragment.files[0].path.as_str()).collect::<Vec<_>>(), targets);
+                    assert_eq!(leases.iter().collect::<HashSet<_>>().len(), 3);
+                }
+                "tamper" => assert_eq!(result.unwrap_err().code, "COMPILE_OUTPUT_INVALID"),
+                _ => {
+                    assert_eq!(result.unwrap_err().code, "COMPILE_AGENT_INPUT_TOO_LARGE");
+                    assert!(!called.lock().unwrap().contains(&targets[1].to_string()),
+                        "the over-budget page never launches an Agent");
+                }
+            }
+        }
+    }
+
+    // 同批前面的页提出了新删除：后面的页按"批开始前"上下文生成的结果过时（串行时它们的
+    // 提示会多出 "Proposed deletions from earlier page fragments"），被丢弃并按串行上下文
+    // 重新生成；最终每页被接受的提示和清单与串行逐字节相同。
+    #[test]
+    fn deletion_proposed_mid_batch_regenerates_later_siblings_with_serial_context() {
+        use std::sync::Mutex;
+        let (root, plan, sources) = independent_pages(3);
+        let derived = plan.items.iter().map(|item| item.target_path.clone()).collect::<Vec<_>>();
+        let (serial, serial_prompts, _) =
+            run_with_parallelism(1, root.path(), &plan, &sources, |_, prompt, _, _| Ok(fragment(prompt)));
+        let calls = Mutex::new(Vec::new());
+        let (parallel, parallel_prompts, progress) = run_with_parallelism(3, root.path(), &plan, &sources, |_, prompt, _, call| {
+            if !is_structural_page(call.target) {
+                calls.lock().unwrap().push((call.target.to_string(), call.regenerated,
+                    call.parallel.map(|lane| (lane.position, lane.batch_size))));
+            }
+            Ok(fragment(prompt))
+        });
+        let mut calls = calls.into_inner().unwrap();
+        calls.sort_by_key(|(target, regenerated, _)| (*regenerated, derived.iter().position(|path| path == target)));
+        assert_eq!(calls, vec![
+            (derived[0].clone(), false, Some((1, 3))),
+            (derived[1].clone(), false, Some((2, 3))),
+            (derived[2].clone(), false, Some((3, 3))),
+            (derived[1].clone(), true, Some((1, 2))),
+            (derived[2].clone(), true, Some((2, 2))),
+        ]);
+        assert!(serial_prompts[&derived[1]].contains("--- Proposed deletions from earlier page fragments ---"));
+        assert_eq!(parallel_prompts, serial_prompts, "the accepted prompts are the serial ones");
+        assert_eq!(serde_json::to_string(&parallel.unwrap().manifest).unwrap(), serde_json::to_string(&serial.unwrap().manifest).unwrap());
+        assert_eq!(progress, [&derived[0], &derived[1], &derived[2], &derived[1], &derived[2]].into_iter().cloned()
+            .chain(["wiki/index.md", "wiki/overview.md", "wiki/log.md"].map(String::from)).collect::<Vec<_>>());
+    }
+
+    // 计划明确依赖同批另一页（affectedExistingPages 点名了一个本次新建的页）：它不和那一页
+    // 同批，留到下一批，从而能读到那一页刚生成的候选；其余互不依赖的页照常并行。
+    #[test]
+    fn pages_naming_a_same_batch_page_wait_for_the_next_batch() {
+        use std::sync::Mutex;
+        let (root, mut plan, sources) = independent_pages(4);
+        let first = plan.items[0].target_path.clone();
+        assert!(!root.path().join(&first).exists(), "the named page is new in this update");
+        plan.items[1].affected_existing_pages = vec![first.clone()];
+        let derived = plan.items.iter().map(|item| item.target_path.clone()).collect::<Vec<_>>();
+        let (serial, serial_prompts, _) =
+            run_with_parallelism(1, root.path(), &plan, &sources, |_, prompt, _, _| Ok(plain_fragment(prompt)));
+        let lanes = Mutex::new(std::collections::BTreeMap::new());
+        let (parallel, parallel_prompts, _) = run_with_parallelism(3, root.path(), &plan, &sources, |cwd, prompt, lane, call| {
+            if !is_structural_page(call.target) {
+                lanes.lock().unwrap().insert(call.target.to_string(), (lane.map(String::from), call.parallel.map(|p| (p.position, p.batch_size))));
+                if call.target == derived[0] {
+                    assert_eq!(cwd, root.path(), "a single-page batch keeps the serial invocation");
+                }
+            }
+            Ok(plain_fragment(prompt))
+        });
+        let lanes = lanes.into_inner().unwrap();
+        assert_eq!(lanes[&derived[0]], (None, None));
+        for (offset, target) in derived[1..].iter().enumerate() {
+            assert_eq!(lanes[target], (Some(target.clone()), Some((offset + 1, 3))));
+        }
+        assert!(parallel_prompts[&derived[1]].contains(&format!("--- {first}; current generated candidate")));
+        assert_eq!(parallel_prompts, serial_prompts);
+        assert_eq!(serde_json::to_string(&parallel.unwrap().manifest).unwrap(), serde_json::to_string(&serial.unwrap().manifest).unwrap());
+    }
+
+    #[test]
+    fn derived_batches_follow_plan_order_dependencies_and_the_parallelism_bound() {
+        let (_root, mut plan, _) = independent_pages(6);
+        let mut targets = plan.items.iter().map(|item| item.target_path.clone()).collect::<Vec<_>>();
+        targets.extend(["wiki/index.md", "wiki/overview.md", "wiki/log.md"].map(String::from));
+        assert_eq!(derived_batch_len(&plan, &targets, 0, 3), 3);
+        assert_eq!(derived_batch_len(&plan, &targets, 3, 3), 3);
+        assert_eq!(derived_batch_len(&plan, &targets, 4, 4), 2, "a batch stops at the structural pages");
+        assert_eq!(derived_batch_len(&plan, &targets, 0, 1), 1);
+        assert_eq!(derived_batch_len(&plan, &targets, 0, 0), 1, "out-of-range values never mean zero");
+        assert_eq!(derived_batch_len(&plan, &targets, 0, 9), 4, "never more than four lanes");
+        // 第 3 页点名第 2 页：第 2 页所在的批在第 3 页之前截断；点名更早批次的页不受影响。
+        plan.items[2].affected_existing_pages = vec![targets[1].clone()];
+        plan.items[4].affected_existing_pages = vec![targets[0].clone()];
+        assert_eq!(derived_batch_len(&plan, &targets, 0, 4), 2);
+        assert_eq!(derived_batch_len(&plan, &targets, 2, 4), 4);
+        // 点名后面的页（反方向）不截断：串行时它本来也只能看到那一页的原文。
+        plan.items[0].affected_existing_pages = vec![targets[1].clone()];
+        assert_eq!(derived_batch_len(&plan, &targets, 0, 2), 2);
+    }
+
+    // 要求：环境变量取值边界——1~4 的整数（允许首尾空白）生效，其余（0、5、负数、小数、
+    // 非数字、空值、未设置）一律回退默认 3。
+    #[test]
+    fn page_parallelism_env_accepts_one_to_four_and_falls_back_to_three() {
+        assert_eq!(DEFAULT_PAGE_PARALLELISM, 3);
+        assert_eq!(PAGE_PARALLELISM_ENV, "LLM_WIKI_PAGE_PARALLELISM");
+        for (raw, expected) in [("1", 1), ("2", 2), ("3", 3), ("4", 4), (" 4\n", 4), ("\t1 ", 1)] {
+            assert_eq!(parse_page_parallelism(Some(raw)), expected, "{raw:?}");
+        }
+        for raw in ["0", "5", "64", "-1", "2.5", "3.0", "three", "", "  ", "1_0", "+2x", "18446744073709551616"] {
+            assert_eq!(parse_page_parallelism(Some(raw)), DEFAULT_PAGE_PARALLELISM, "{raw:?}");
+        }
+        assert_eq!(parse_page_parallelism(None), DEFAULT_PAGE_PARALLELISM);
+        assert_eq!(CandidateGenerationOptions::for_tests().page_parallelism, DEFAULT_PAGE_PARALLELISM);
+    }
+
+    #[test]
+    fn batch_outcome_prefers_the_first_real_error_in_plan_order() {
+        let page = |target: &str| CompileManifest { files: vec![CompileFile::new(target, "# Page")], deletions: vec![], summary: "s".into() };
+        let ok = batch_outcome(vec![Ok(page("wiki/a.md")), Ok(page("wiki/b.md"))]).unwrap();
+        assert_eq!(ok.iter().map(|m| m.files[0].path.as_str()).collect::<Vec<_>>(), ["wiki/a.md", "wiki/b.md"]);
+        let error = batch_outcome(vec![
+            Err(page_batch_aborted_error()),
+            Ok(page("wiki/b.md")),
+            Err(BackendError::new("AGENT_EXIT_FAILED", "first real", true, false)),
+            Err(BackendError::new("COMPILE_OUTPUT_INVALID", "second real", true, true)),
+        ]).unwrap_err();
+        assert_eq!((error.code.as_str(), error.message.as_str()), ("AGENT_EXIT_FAILED", "first real"));
+        assert_eq!(batch_outcome(vec![Ok(page("wiki/a.md")), Err(page_batch_aborted_error())]).unwrap_err().code, PAGE_BATCH_ABORTED);
     }
 
     #[test]
