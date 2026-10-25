@@ -1405,7 +1405,7 @@ fn global_settings_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn default_config_dir() -> PathBuf {
+pub(super) fn default_config_dir() -> PathBuf {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         return PathBuf::from(appdata).join("llm-wiki-desktop");
     }

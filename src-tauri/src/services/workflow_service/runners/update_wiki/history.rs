@@ -124,7 +124,8 @@ pub fn undo_update_wiki_history(
             .source_versions
             .iter()
             .filter(|source| !source.source_id.starts_with("legacy-"))
-            .map(|source| format!(".app/sources/{}.json", source.source_id)),
+            .map(|source| context.layout.source_paths()?.manifest(&source.source_id))
+            .collect::<Result<Vec<_>, BackendError>>()?,
     );
     paths.sort();
     paths.dedup();

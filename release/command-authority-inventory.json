@@ -100,7 +100,8 @@
         "mutation"
       ],
       "projectScoped": true,
-      "writeAuthority": "ProjectWritePermit"
+      "writeAuthority": "ProjectWritePermit",
+      "authorityFunction": "accept_import_scan_with_guard"
     },
     {
       "name": "activate_import_v2",
@@ -1822,7 +1823,8 @@
         "mutation"
       ],
       "projectScoped": true,
-      "writeAuthority": "ProjectWritePermit"
+      "writeAuthority": "ProjectWritePermit",
+      "authorityFunction": "start_add_import_paths_with_guard"
     },
     {
       "name": "start_deep_lint",
@@ -1862,7 +1864,8 @@
         "mutation"
       ],
       "projectScoped": true,
-      "writeAuthority": "ProjectWritePermit"
+      "writeAuthority": "ProjectWritePermit",
+      "authorityFunction": "start_import_batch_with_guard"
     },
     {
       "name": "start_import_items_v2",

@@ -135,3 +135,6 @@ pub(crate) use workflow_service::{
 pub(crate) use workflow_service::update_wiki_review_can_inline;
 #[cfg(any(feature = "gui", test))]
 pub mod window_lifecycle;
+
+#[cfg(feature = "local-api")]
+pub(crate) fn backend_instance_config_dir() -> std::path::PathBuf { settings_service::default_config_dir() }

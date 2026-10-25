@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompilePromptRoute {
     ByokPlan,
+    AgentReadOnlyPlan,
     ByokManifest,
     Agent,
 }
@@ -60,6 +61,9 @@ pub fn render_compile_prompt_header_with_policy(
     let route_header = match route {
         CompilePromptRoute::ByokPlan => {
             "Return only CompilePlan JSON matching {summary,items:[{action,targetPath,pageType,sourceIds,affectedExistingPages,reason,riskFlags}],globalRiskFlags}. Do not return Markdown files in this step. You only know the files included in this prompt; you have no filesystem or tool access."
+        }
+        CompilePromptRoute::AgentReadOnlyPlan => {
+            "Return only CompilePlan JSON matching {summary,items:[{action,targetPath,pageType,sourceIds,affectedExistingPages,reason,riskFlags}],globalRiskFlags}. Do not return Markdown files in this step. Use read-only file tools to inspect only the listed existing Wiki files inside the supplied compile workspace, in bounded sections as needed. Never write, modify, or delete files, execute commands with side effects, access the network, or read outside that workspace. Do not claim coverage without reading the relevant existing evidence."
         }
         CompilePromptRoute::ByokManifest => {
             if allow_reviewable_deletions {

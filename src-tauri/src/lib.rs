@@ -2,6 +2,8 @@ pub mod app_state;
 #[cfg(feature = "gui")]
 pub mod commands;
 pub mod errors;
+#[cfg(feature = "local-api")]
+pub mod local_api;
 pub mod models;
 pub mod services;
 pub mod tasks;
@@ -165,13 +167,40 @@ fn observe_workflow_adapter_error(task_id: &str, phase: &str, message: &str) {
 #[cfg(feature = "gui")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(feature = "local-api")]
+    if local_api::handle_token_command() {return;}
+    let mut context = tauri::generate_context!();
+    #[cfg(feature = "local-api")]
+    let api_launch = match local_api::ApiLaunch::from_args() {
+        Ok(launch) => launch,
+        Err(error) => {
+            eprintln!("Local API startup refused: {error}");
+            return;
+        }
+    };
+    #[cfg(feature = "local-api")]
+    let _instance_lease = match local_api::InstanceLease::acquire(
+        &services::backend_instance_config_dir(),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("Another backend owns this application instance, or the lease is unavailable: {error}");
+            return;
+        }
+    };
+    #[cfg(feature = "local-api")]
+    if api_launch.as_ref().is_some_and(|launch| launch.headless) {
+        context.config_mut().app.windows.clear();
+    }
     tauri::Builder::default()
         .manage(services::window_lifecycle::WindowLifecycle::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state::AppState::default())
-        .setup(|app| {
+        .setup(move |app| {
+            #[cfg(all(feature = "local-api", target_os = "macos"))]
+            if api_launch.as_ref().is_some_and(|launch| launch.headless) { app.set_activation_policy(tauri::ActivationPolicy::Accessory); }
             let handle = app.handle().clone();
             let state = app.state::<app_state::AppState>();
 
@@ -735,6 +764,8 @@ pub fn run() {
                 });
             }
 
+            #[cfg(feature = "local-api")]
+            if let Some(launch) = api_launch { local_api::start(handle.clone(), launch); }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -971,7 +1002,7 @@ pub fn run() {
             commands::export_commands::open_export_in_browser,
             commands::export_commands::open_export_folder,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("failed to run LLM Wiki Desktop");
 }
 

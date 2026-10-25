@@ -193,15 +193,14 @@ pub fn parse_frontmatter_checked(raw: &str) -> Result<Frontmatter, String> {
                             ));
                         }
                         let parsed = if let serde_json::Value::Array(values) = &value {
-                            let items = values
-                                .iter()
-                                .map(&scalar)
-                                .collect::<Option<Vec<_>>>()
-                                .ok_or_else(|| {
-                                    serde::de::Error::custom(
-                                        "frontmatter lists must contain scalars",
-                                    )
-                                })?;
+                            let Some(items) = values.iter().map(&scalar).collect::<Option<Vec<_>>>() else {
+                                // Preserve rich provenance in the original Markdown. Like nested
+                                // mappings, unknown nested lists are outside the reader projection.
+                                if matches!(key.to_ascii_lowercase().as_str(), "sources" | "tags" | "aliases" | "related") {
+                                    return Err(serde::de::Error::custom("frontmatter lists must contain scalars"));
+                                }
+                                continue;
+                            };
                             FrontmatterValue::List(items)
                         } else if let Some(value) = scalar(&value) {
                             FrontmatterValue::Scalar(value)
@@ -909,6 +908,18 @@ mod tests {
     #[test]
     fn snippet_returns_none_when_no_match() {
         assert!(snippet_for_query("nothing here", "missing", 5).is_none());
+    }
+
+    #[test]
+    fn strict_frontmatter_accepts_nested_provenance_without_projecting_it() {
+        let yaml = "type: synthesis\nsources: [\"raw/sources/来源.md\"]\nsource_versions: [{source_id: source-a, version_id: version-a}]\n";
+        let parsed = parse_frontmatter_checked(yaml).expect("valid YAML provenance is not a reader scalar/list field");
+        assert_eq!(parsed.get_scalar("type").as_deref(), Some("synthesis"));
+        assert_eq!(parsed.get_list("sources"), vec!["raw/sources/来源.md"]);
+        assert!(parsed.get("source_versions").is_none());
+        assert!(parse_frontmatter_checked("sources: [{path: source.md}]").is_err());
+        assert!(parse_frontmatter_checked("tags: [{label: unsafe}]").is_err());
+        assert!(parse_frontmatter_checked("type: synthesis\nTYPE: concept").is_err());
     }
 
     #[test]

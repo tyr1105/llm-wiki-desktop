@@ -62,7 +62,9 @@ fn batch_one_scan_acceptance_owns_operation_creation_and_dispatch() {
         .next()
         .unwrap();
     assert!(accept.contains("accept_scan_inputs_with_operation_authorized"));
-    assert!(accept.contains("dispatch_claimed_import_batch_for_state"));
+    assert!(accept.contains("accept_import_scan_with_guard"));
+    assert!(accept.contains("dispatch_claimed_import_batch_with_guard"));
+    assert!(accept.contains("input_guard"));
     assert!(accept.contains("recover_claimed_scan_operation"));
     assert!(!accept.contains("add_inputs_authorized"));
 

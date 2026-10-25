@@ -1257,9 +1257,29 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
         tasks: &TaskService,
         task_id: &str,
     ) -> Result<String, BackendError> {
+        self.run_task_streaming_for_agent_with_lane(kind, invocation, tasks, task_id, None)
+    }
+
+    // Parallel compile scaffolds share cancellation and task persistence, but
+    // their activity identities and transient output streams must not collide.
+    pub(crate) fn run_task_streaming_for_agent_with_lane(
+        &self,
+        kind: AgentKind,
+        invocation: &AgentInvocation,
+        tasks: &TaskService,
+        task_id: &str,
+        lane: Option<&str>,
+    ) -> Result<String, BackendError> {
         let invocation = self.bind_verified_agent_invocation(kind, invocation)?;
-        let on_activity = |activity: TaskActivity| tasks.emit_activity(task_id, activity);
+        let on_activity = |activity: TaskActivity| {
+            if let Some(activity) = compile_lane_activity(activity, lane) {
+                tasks.emit_activity(task_id, activity);
+            }
+        };
         let on_delta = |delta: &str| {
+            if lane.is_some() {
+                return;
+            }
             tasks.emit_stream_delta(
                 task_id,
                 crate::models::task::StreamDelta {
@@ -1268,14 +1288,11 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
                 },
             );
         };
-        tasks.emit_activity(
-            task_id,
-            TaskActivity::Phase {
-                name: "agent".into(),
-                status: TaskActivityStatus::Started,
-                label: Some("Agent started".into()),
-            },
-        );
+        on_activity(TaskActivity::Phase {
+            name: "agent".into(),
+            status: TaskActivityStatus::Started,
+            label: Some("Agent started".into()),
+        });
         let result = self.runner.run_task_streaming_isolated_with_all_events(
             &invocation,
             tasks,
@@ -1284,22 +1301,19 @@ Return only the proposed Markdown candidate on stdout.\n\n{skill}\n\n<authorized
             &on_delta,
             &on_activity,
         );
-        tasks.emit_activity(
-            task_id,
-            TaskActivity::Phase {
-                name: "agent".into(),
-                status: if result.is_ok() {
-                    TaskActivityStatus::Completed
-                } else {
-                    TaskActivityStatus::Failed
-                },
-                label: Some(if result.is_ok() {
-                    "Agent response ready".into()
-                } else {
-                    "Agent response failed".into()
-                }),
+        on_activity(TaskActivity::Phase {
+            name: "agent".into(),
+            status: if result.is_ok() {
+                TaskActivityStatus::Completed
+            } else {
+                TaskActivityStatus::Failed
             },
-        );
+            label: Some(if result.is_ok() {
+                "Agent response ready".into()
+            } else {
+                "Agent response failed".into()
+            }),
+        });
         result
     }
 
@@ -1909,6 +1923,44 @@ fn run_streaming_process_with_events(
     )
 }
 
+fn compile_lane_activity(activity: TaskActivity, lane: Option<&str>) -> Option<TaskActivity> {
+    let Some(lane) = lane else {
+        return Some(activity);
+    };
+    Some(match activity {
+        TaskActivity::Phase {
+            name,
+            status,
+            label,
+        } => TaskActivity::Phase {
+            name: format!("compile-scaffold:{lane}:{name}"),
+            status,
+            label: label.map(|label| format!("{label} ({lane})")),
+        },
+        // The enclosing named phase remains observable. Untagged thinking
+        // events cannot be correctly paired across two simultaneous calls.
+        TaskActivity::Thinking { .. } => return None,
+        TaskActivity::ToolCall {
+            call_id,
+            name,
+            detail,
+        } => TaskActivity::ToolCall {
+            call_id: format!("compile-scaffold:{lane}:{call_id}"),
+            name,
+            detail,
+        },
+        TaskActivity::ToolResult {
+            call_id,
+            success,
+            summary,
+        } => TaskActivity::ToolResult {
+            call_id: format!("compile-scaffold:{lane}:{call_id}"),
+            success,
+            summary,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_process_with_events_and_limits(
     invocation: &AgentInvocation,
@@ -2071,12 +2123,21 @@ fn run_streaming_process_with_events_and_limits(
                     }
                     return Ok(stdout);
                 }
-                return Err(BackendError::new(
+                let error = BackendError::new(
                     "AGENT_EXIT_FAILED",
                     format!("Agent exited with {status}."),
                     true,
                     false,
-                ));
+                );
+                return Err(if parser.structured {
+                    error.with_details(serde_json::json!({
+                        "agentFailureCategory": parser.failure_category.unwrap_or("unclassified"),
+                        "exitCode": status.code(),
+                        "structuredTerminalSeen": parser.terminal_seen
+                    }))
+                } else {
+                    error
+                });
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
@@ -2099,6 +2160,31 @@ fn is_structured_invocation(invocation: &AgentInvocation) -> bool {
         .any(|arg| arg == "stream-json" || arg == "--json")
 }
 
+// Return only fixed diagnostic labels. Never persist upstream message text,
+// URLs, request bodies, tokens, or model output in BackendError details.
+fn agent_failure_category(message: &str) -> &'static str {
+    let text = message.to_ascii_lowercase();
+    if text.contains("context_length_exceeded") || text.contains("maximum context length") {
+        "context_limit"
+    } else if text.contains("invalid_api_key") || text.contains("unexpected status 401") || text.contains("unexpected status 403") {
+        "authentication_or_access"
+    } else if text.contains("insufficient_quota") || text.contains("usage_limit_reached") {
+        "quota_limit"
+    } else if text.contains("rate_limit_exceeded") || text.contains("unexpected status 429") {
+        "rate_limit"
+    } else if text.contains("model_not_found") {
+        "model_unavailable"
+    } else if text.contains("unexpected status 400") || text.contains("invalid_request_error") {
+        "request_rejected"
+    } else if text.contains("stream disconnected") || text.contains("error sending request") || text.contains("connection reset") {
+        "connection_or_stream"
+    } else if text.contains("unexpected status 500") || text.contains("unexpected status 502") || text.contains("unexpected status 503") || text.contains("unexpected status 504") {
+        "upstream_unavailable"
+    } else {
+        "unclassified"
+    }
+}
+
 struct ParsedAgentLine {
     text: Option<String>,
     activities: Vec<TaskActivity>,
@@ -2115,6 +2201,9 @@ struct AgentOutputParser {
     thinking_started_at: Option<Instant>,
     seen_tool_calls: HashSet<String>,
     pending_json: String,
+    completed_answer: Option<String>,
+    codex_error_awaiting_failure: bool,
+    failure_category: Option<&'static str>,
 }
 
 impl AgentOutputParser {
@@ -2130,6 +2219,9 @@ impl AgentOutputParser {
             thinking_started_at: None,
             seen_tool_calls: HashSet::new(),
             pending_json: String::new(),
+            completed_answer: None,
+            codex_error_awaiting_failure: false,
+            failure_category: None,
         }
     }
 
@@ -2181,8 +2273,24 @@ impl AgentOutputParser {
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        if self.terminal_seen {
+        // codex exec reports a fatal error and then closes the same turn with
+        // turn.failed. This is one failed outcome, not trailing successful work.
+        // No other event after a terminal is accepted, including a second close.
+        let closes_codex_error = self.codex_error_awaiting_failure && event_type == "turn.failed";
+        if self.terminal_seen && !closes_codex_error {
             self.invalid_terminal_sequence = true;
+        }
+        self.codex_error_awaiting_failure = event_type == "error" && !self.terminal_seen;
+        if matches!(event_type, "error" | "turn.failed" | "response.failed" | "response.incomplete") {
+            if let Some(message) = value.get("message")
+                .or_else(|| value.pointer("/error/message"))
+                .or_else(|| value.pointer("/response/error/message"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if self.failure_category.is_none_or(|category| category == "unclassified") {
+                    self.failure_category = Some(agent_failure_category(message));
+                }
+            }
         }
         if event_type.is_empty() && value.get("ok").and_then(|value| value.as_bool()).is_some() {
             // OpenClaw agent exec --json emits one complete envelope.
@@ -2292,22 +2400,29 @@ impl AgentOutputParser {
     }
 
     fn validate_line(&self) -> Result<(), BackendError> {
-        if self.malformed_structured_line
-            || self.invalid_terminal_sequence
-            || !self.pending_json.is_empty()
-        {
+        if self.malformed_structured_line || self.invalid_terminal_sequence {
             return Err(lint_agent_output_malformed_error(
                 "Agent emitted malformed structured output.",
-            ));
+            ).with_details(serde_json::json!({
+                "transportReason": if self.malformed_structured_line { "invalid_json" } else { "event_after_terminal" }
+            })));
         }
         Ok(())
     }
 
     fn validate_terminal(&self) -> Result<(), BackendError> {
+        if !self.pending_json.is_empty() {
+            return Err(lint_agent_output_malformed_error(
+                "Agent output ended within an incomplete structured document.",
+            ).with_details(serde_json::json!({"transportReason": "incomplete_json"})));
+        }
         if self.structured && (!self.terminal_seen || !self.terminal_success) {
             return Err(lint_agent_output_malformed_error(
                 "Agent lint completed without a final successful structured terminal result.",
-            ));
+            ).with_details(serde_json::json!({
+                "transportReason": if self.terminal_seen { "unsuccessful_terminal" } else { "missing_terminal" },
+                "agentFailureCategory": self.failure_category.unwrap_or("unclassified")
+            })));
         }
         self.validate_line()
     }
@@ -2426,6 +2541,12 @@ impl AgentOutputParser {
                 .or_else(|| item.get("content").and_then(|value| value.as_str()))
                 .filter(|text| !text.is_empty())
             {
+                // Codex may complete a commentary message before using tools.
+                // Keep the last complete answer for the successful terminal;
+                // transient UI deltas must not become the CompilePlan payload.
+                if completed {
+                    self.completed_answer = Some(text.to_string());
+                }
                 // Some Codex-compatible CLIs only attach the final visible
                 // text to item.completed. If output_text.delta already
                 // streamed it, the completed item is the same text and must
@@ -2689,6 +2810,11 @@ fn process_agent_output_line(
             stdout.push('\n');
         }
         on_delta(&text);
+    }
+    if parser.terminal_seen && parser.terminal_success {
+        if let Some(final_text) = &parser.completed_answer {
+            stdout.clone_from(final_text);
+        }
     }
     for activity in parsed.activities {
         on_activity(activity.clone());
@@ -4143,6 +4269,156 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn compile_scaffold_activity_lanes_pair_phases_and_tools_without_stream_collision() {
+        for lane in ["wiki/index.md", "wiki/overview.md"] {
+            for status in [
+                TaskActivityStatus::Started,
+                TaskActivityStatus::Completed,
+                TaskActivityStatus::Failed,
+            ] {
+                let mapped = compile_lane_activity(
+                    TaskActivity::Phase {
+                        name: "agent".into(),
+                        status: status.clone(),
+                        label: Some("Agent".into()),
+                    },
+                    Some(lane),
+                )
+                .unwrap();
+                let TaskActivity::Phase {
+                    name,
+                    status: actual,
+                    label,
+                } = mapped
+                else {
+                    panic!("phase expected")
+                };
+                assert_eq!(name, format!("compile-scaffold:{lane}:agent"));
+                assert_eq!(actual, status);
+                assert_eq!(label, Some(format!("Agent ({lane})")));
+            }
+            let call = compile_lane_activity(
+                TaskActivity::ToolCall {
+                    call_id: "same-id".into(),
+                    name: "read".into(),
+                    detail: None,
+                },
+                Some(lane),
+            )
+            .unwrap();
+            let result = compile_lane_activity(
+                TaskActivity::ToolResult {
+                    call_id: "same-id".into(),
+                    success: true,
+                    summary: None,
+                },
+                Some(lane),
+            )
+            .unwrap();
+            let TaskActivity::ToolCall { call_id, .. } = call else {
+                panic!("call expected")
+            };
+            let TaskActivity::ToolResult {
+                call_id: result_id, ..
+            } = result
+            else {
+                panic!("result expected")
+            };
+            assert_eq!(call_id, result_id);
+            assert_eq!(call_id, format!("compile-scaffold:{lane}:same-id"));
+            assert!(compile_lane_activity(
+                TaskActivity::Thinking {
+                    status: TaskActivityStatus::Started,
+                    summary: None,
+                    duration_ms: None
+                },
+                Some(lane)
+            )
+            .is_none());
+        }
+        let ordinary = TaskActivity::Phase {
+            name: "agent".into(),
+            status: TaskActivityStatus::Started,
+            label: None,
+        };
+        assert_eq!(
+            compile_lane_activity(ordinary.clone(), None),
+            Some(ordinary)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_compile_cancellation_reaps_both_isolated_process_groups() {
+        let owner = std::env::temp_dir().join("llm-wiki-desktop");
+        ensure_private_directory(&owner).unwrap();
+        let leases = [
+            tempfile::Builder::new()
+                .prefix("cancel-scaffold-")
+                .tempdir_in(&owner)
+                .unwrap(),
+            tempfile::Builder::new()
+                .prefix("cancel-scaffold-")
+                .tempdir_in(&owner)
+                .unwrap(),
+        ];
+        let tasks = TaskService::default();
+        let task = tasks.create_task(
+            TaskType::WikiCompile,
+            Some("synthetic".into()),
+            "cancel pair".into(),
+            true,
+        );
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            let handles = leases.iter().map(|lease| {
+                let tasks = &tasks; let id = &task.id;
+                scope.spawn(move || {
+                    run_streaming_process_with_events_and_limits(&AgentInvocation {
+                        program:"/bin/sh".into(),
+                        args:vec!["-c".into(), "(printf ready > child-ready; while [ ! -f release ]; do sleep 0.02; done; printf orphan > orphan) & wait".into()],
+                        stdin:None, cwd:lease.path().to_path_buf(),
+                    }, tasks, id, &|_| {}, &|_| {}, false, None, 1024, Duration::from_secs(5))
+                })
+            }).collect::<Vec<_>>();
+            while leases
+                .iter()
+                .any(|lease| !lease.path().join("child-ready").exists())
+                && start.elapsed() < Duration::from_secs(3)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let both_started = leases
+                .iter()
+                .all(|lease| lease.path().join("child-ready").exists());
+            tasks.request_cancel(&task.id).unwrap();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap().unwrap_err().code, "AGENT_CANCELLED");
+            }
+            assert!(
+                both_started,
+                "both independent processes must have started before cancellation"
+            );
+        });
+        assert!(start.elapsed() < Duration::from_secs(4));
+        for lease in &leases {
+            std::fs::write(lease.path().join("release"), "release").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        for lease in &leases {
+            assert!(
+                !lease.path().join("orphan").exists(),
+                "cancel must reap each process group"
+            );
+            assert!(lease.path().join("runtime-home").is_dir());
+        }
+        assert_ne!(
+            leases[0].path().join("runtime-home"),
+            leases[1].path().join("runtime-home")
+        );
+    }
 
     #[derive(Default)]
     struct SourceAiRunnerProbe {
@@ -6725,6 +7001,84 @@ mod tests {
             post_terminal.validate_terminal().unwrap_err().code,
             "LINT_AGENT_OUTPUT_MALFORMED"
         );
+    }
+
+    #[test]
+    fn terminal_sequence_codex_failure_pair_is_valid_but_never_success() {
+        let mut parser = AgentOutputParser::new(true);
+        parser.parse(r#"{"type":"error","message":"unexpected status 400 Bad Request PRIVATE_SYNTHETIC_PAYLOAD"}"#);
+        parser.validate_line().unwrap();
+        parser.parse(r#"{"type":"turn.failed","error":{"message":"unexpected status 400 Bad Request PRIVATE_SYNTHETIC_PAYLOAD"}}"#);
+        parser.validate_line().expect("installed CLI closes a fatal error with turn.failed");
+        let error = parser.validate_terminal().unwrap_err();
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["transportReason"], "unsuccessful_terminal");
+        assert_eq!(details["agentFailureCategory"], "request_rejected");
+        assert!(!format!("{error:?}").contains("PRIVATE_SYNTHETIC_PAYLOAD"));
+    }
+
+    #[test]
+    fn terminal_sequence_failed_then_success_stays_rejected() {
+        for trailer in [r#"{"type":"turn.completed"}"#, r#"{"type":"item.completed","item":{"type":"agent_message","text":"fabricated success"}}"#] {
+            let mut parser = AgentOutputParser::new(true);
+            parser.parse(r#"{"type":"error","message":"failure"}"#);
+            parser.parse(trailer);
+            assert!(parser.validate_line().is_err());
+        }
+        let mut parser = AgentOutputParser::new(true);
+        parser.parse(r#"{"type":"turn.completed"}"#);
+        parser.parse(r#"{"type":"turn.failed","error":{"message":"failure"}}"#);
+        assert!(parser.validate_line().is_err());
+    }
+
+    #[test]
+    fn transport_capture_uses_final_codex_message_after_commentary() {
+        let tasks = TaskService::default();
+        let task = tasks.create_task(TaskType::DeepLint, Some("synthetic".into()), "capture".into(), true);
+        let mut parser = AgentOutputParser::new(true);
+        let mut output = String::new();
+        let mut count = 0;
+        for event in [
+            r#"{"type":"item.completed","item":{"id":"commentary","type":"agent_message","text":"Reading the listed file."}}"#,
+            r#"{"type":"item.started","item":{"id":"read","type":"command_execution","command":"cat synthetic.md"}}"#,
+            r#"{"type":"item.completed","item":{"id":"final","type":"agent_message","text":"{\"summary\":\"Final plan\",\"items\":[]}"}}"#,
+            r#"{"type":"turn.completed"}"#,
+        ] {
+            process_agent_output_line(&mut parser, LogLevel::Info, event, event.len()+1, &mut output, &mut count, MAX_AGENT_CAPTURE_BYTES, false, &tasks, &task.id, &|_| {}, &|_| {}).unwrap();
+        }
+        parser.validate_terminal().unwrap();
+        assert_eq!(output, r#"{"summary":"Final plan","items":[]}"#);
+    }
+
+    #[test]
+    fn transport_capture_accepts_complete_pretty_envelope() {
+        let tasks = TaskService::default();
+        let task = tasks.create_task(TaskType::DeepLint, Some("synthetic".into()), "capture".into(), true);
+        let mut parser = AgentOutputParser::new(true);
+        let mut output = String::new();
+        let mut count = 0;
+        for event in ["{", "  \"ok\": true,", "  \"status\": \"ok\",", "  \"final\": \"final synthetic text\"", "}"] {
+            process_agent_output_line(&mut parser, LogLevel::Info, event, event.len()+1, &mut output, &mut count, MAX_AGENT_CAPTURE_BYTES, false, &tasks, &task.id, &|_| {}, &|_| {}).unwrap();
+        }
+        parser.validate_terminal().unwrap();
+        assert_eq!(output, "final synthetic text");
+    }
+
+    #[test]
+    fn transport_errors_identify_shape_without_private_output() {
+        let mut invalid = AgentOutputParser::new(true);
+        invalid.parse("PRIVATE_SYNTHETIC_INVALID_JSON");
+        let error = invalid.validate_line().unwrap_err();
+        assert_eq!(error.details.as_ref().unwrap()["transportReason"], "invalid_json");
+        assert!(!format!("{error:?}").contains("PRIVATE_SYNTHETIC"));
+        let mut partial = AgentOutputParser::new(true);
+        partial.parse("{");
+        let error = partial.validate_terminal().unwrap_err();
+        assert_eq!(error.details.as_ref().unwrap()["transportReason"], "incomplete_json");
+        let mut late = AgentOutputParser::new(true);
+        late.parse(r#"{"type":"turn.completed"}"#);
+        late.parse(r#"{"type":"turn.started"}"#);
+        assert_eq!(late.validate_line().unwrap_err().details.as_ref().unwrap()["transportReason"], "event_after_terminal");
     }
 
     #[cfg(windows)]

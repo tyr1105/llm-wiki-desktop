@@ -32,6 +32,10 @@ use byok_batch_cache::ByokBatchCache;
 #[path = "compile_service/source_context.rs"]
 mod source_context;
 use source_context::SourceContext;
+#[path = "compile_service/agent_pages.rs"]
+mod agent_pages;
+#[path = "compile_service/agent_plan.rs"]
+mod agent_plan;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileApplyOutcome {
@@ -96,6 +100,17 @@ pub struct ResolvedCompileSource {
     pub registry: CompileSourceRegistry,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceSourceInput {
+    registry_source_id: String,
+    version_id: String,
+    content_hash: String,
+    path: String,
+}
+
+const WORKSPACE_SOURCE_INPUTS: &str = ".compile-source-inputs.json";
+
 pub struct CompileExecutionServices<'a> {
     pub agent_service: &'a AgentService,
     pub llm_service: &'a LlmService,
@@ -148,25 +163,7 @@ impl CompileService {
         prompt.push('\n');
         prompt.push_str(&crate::utils::i18n::language_instruction(language));
         prompt.push_str(" Write each page's prose body in that language; keep frontmatter keys, paths, and this JSON structure in English.\n");
-        for name in ["purpose.md", "schema.md"] {
-            let content = std::fs::read_to_string(workspace.join(name)).map_err(|error| {
-                BackendError::new("COMPILE_INPUT_READ_FAILED", error.to_string(), true, false)
-            })?;
-            prompt.push_str(&format!("\n--- {name} ---\n{content}"));
-        }
-        for root in [workspace.join("raw/extracted"), workspace.join("wiki")] {
-            for file in FileStore.list_markdown_files(&root)? {
-                let relative = file
-                    .strip_prefix(workspace)
-                    .unwrap_or(&file)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let content = std::fs::read_to_string(&file).map_err(|error| {
-                    BackendError::new("COMPILE_INPUT_READ_FAILED", error.to_string(), true, false)
-                })?;
-                prompt.push_str(&format!("\n--- {relative} ---\n{content}"));
-            }
-        }
+        Self::append_workspace_markdown(&mut prompt, workspace)?;
         Ok(prompt)
     }
 
@@ -183,8 +180,22 @@ impl CompileService {
         language: &str,
         policy: CompileGenerationPolicy,
     ) -> Result<String, BackendError> {
+        let mut prompt = Self::plan_prompt_header(language, policy);
+        Self::append_workspace_markdown(&mut prompt, workspace)?;
+        Ok(prompt)
+    }
+
+    fn plan_prompt_header(language: &str, policy: CompileGenerationPolicy) -> String {
+        Self::plan_prompt_header_for_route(CompilePromptRoute::ByokPlan, language, policy)
+    }
+
+    fn plan_prompt_header_for_route(
+        route: CompilePromptRoute,
+        language: &str,
+        policy: CompileGenerationPolicy,
+    ) -> String {
         let mut prompt = crate::services::render_compile_prompt_header_with_policy(
-            CompilePromptRoute::ByokPlan,
+            route,
             language,
             policy.allows_reviewable_deletions(),
         );
@@ -194,8 +205,7 @@ impl CompileService {
         } else {
             prompt.push_str("Every selected Source must appear in sourceIds of at least one derived plan item. If a Source cannot be integrated, stop and explain why; never omit it while reporting success.\n");
         }
-        Self::append_workspace_markdown(&mut prompt, workspace)?;
-        Ok(prompt)
+        prompt
     }
 
     pub fn provider_manifest_prompt(
@@ -346,8 +356,7 @@ impl CompileService {
                     )
                     .map_err(task_operation_error)?;
                 // All Agent routes bind a plan before requesting candidate bodies.
-                let plan_prompt =
-                    Self::provider_plan_prompt_with_policy(workspace, &language, policy)?;
+                let plan_prompt = agent_plan::prompt(*agent, workspace, &language, policy)?;
                 let invocation = AgentService::chat_invocation(*agent, workspace, &plan_prompt)?;
                 let raw_plan = services.agent_service.run_task_streaming_for_agent(
                     *agent,
@@ -368,6 +377,50 @@ impl CompileService {
                 observer.begin_candidate_generation()?;
                 let manifest = if plan.items.is_empty() {
                     empty_manifest(&plan)
+                } else if policy == CompileGenerationPolicy::WorkflowReviewableDeletes {
+                    agent_pages::generate_with_parallel_scaffolds_for_agent(
+                        *agent,
+                        workspace,
+                        &language,
+                        &plan,
+                        sources,
+                        &dependencies,
+                        |invocation_workspace, prompt, lane| {
+                            if services.task_service.is_cancelled(task_id) {
+                                return Err(BackendError::new(
+                                    "AGENT_CANCELLED",
+                                    "Wiki generation was cancelled.",
+                                    true,
+                                    false,
+                                ));
+                            }
+                            agent_plan::validate_input(*agent, prompt)?;
+                            let invocation = AgentService::chat_invocation(
+                                *agent,
+                                invocation_workspace,
+                                prompt,
+                            )?;
+                            services
+                                .agent_service
+                                .run_task_streaming_for_agent_with_lane(
+                                    *agent,
+                                    &invocation,
+                                    services.task_service,
+                                    task_id,
+                                    lane,
+                                )
+                        },
+                        |index, total, target| {
+                            services
+                                .task_service
+                                .append_log(
+                                    task_id,
+                                    LogLevel::Info,
+                                    format!("Generating Wiki page {index}/{total}: {target}"),
+                                )
+                                .map_err(task_operation_error)
+                        },
+                    )?
                 } else {
                     let prompt = Self::provider_manifest_prompt_with_policy(
                         workspace,
@@ -375,6 +428,7 @@ impl CompileService {
                         Some(&plan),
                         policy,
                     )?;
+                    agent_plan::validate_input(*agent, &prompt)?;
                     let invocation = AgentService::chat_invocation(*agent, workspace, &prompt)?;
                     let raw = services.agent_service.run_task_streaming_for_agent(
                         *agent,
@@ -595,8 +649,40 @@ impl CompileService {
             })?;
             prompt.push_str(&format!("\n--- {name} ---\n{content}"));
         }
+        let mut files = Vec::new();
         for root in [workspace.join("raw/extracted"), workspace.join("wiki")] {
-            for file in FileStore.list_markdown_files(&root)? {
+            files.extend(FileStore.list_markdown_files(&root)?);
+        }
+        let catalog_path = workspace.join(WORKSPACE_SOURCE_INPUTS);
+        if catalog_path.is_file() {
+            let catalog_text = std::fs::read_to_string(&catalog_path)
+                .map_err(|error| io_error("COMPILE_INPUT_READ_FAILED", error, &catalog_path))?;
+            let catalog: Vec<WorkspaceSourceInput> = serde_json::from_str(&catalog_text)
+                .map_err(|error| BackendError::new("COMPILE_INPUT_READ_FAILED", error.to_string(), true, false))?;
+            let workspace_root = std::fs::canonicalize(workspace)
+                .map_err(|error| io_error("COMPILE_INPUT_READ_FAILED", error, workspace))?;
+            for source in &catalog {
+                let relative = Path::new(&source.path);
+                if relative.as_os_str().is_empty()
+                    || relative.components().any(|part| !matches!(part, Component::Normal(_)))
+                    || relative.extension().and_then(|extension| extension.to_str()).map(|extension| !extension.eq_ignore_ascii_case("md")).unwrap_or(true)
+                {
+                    return Err(BackendError::new("COMPILE_INPUT_PATH_INVALID", "Selected Source path must be a relative Markdown path inside the candidate workspace.", true, false));
+                }
+                let file = workspace.join(relative);
+                let canonical = std::fs::canonicalize(&file)
+                    .map_err(|error| io_error("COMPILE_INPUT_READ_FAILED", error, &file))?;
+                if !canonical.starts_with(&workspace_root) || !canonical.is_file() {
+                    return Err(BackendError::new("COMPILE_INPUT_PATH_INVALID", "Selected Source path leaves the candidate workspace.", true, false));
+                }
+            }
+            prompt.push_str("\n--- Selected Source versions ---\nUse each listed path for CompilePlan sourceIds and Source citations; registrySourceId and versionId are provenance, not path aliases. These paths override generic source-directory examples. Sources are read-only.\n");
+            prompt.push_str(&catalog_text);
+            files.extend(catalog.into_iter().map(|source| workspace.join(source.path)));
+        }
+        files.sort();
+        files.dedup();
+        for file in files {
                 let relative = file
                     .strip_prefix(workspace)
                     .unwrap_or(&file)
@@ -606,7 +692,6 @@ impl CompileService {
                     BackendError::new("COMPILE_INPUT_READ_FAILED", error.to_string(), true, false)
                 })?;
                 prompt.push_str(&format!("\n--- {relative} ---\n{content}"));
-            }
         }
         Ok(())
     }
@@ -618,21 +703,31 @@ impl CompileService {
         baseline: &HashMap<String, String>,
     ) -> Result<(), BackendError> {
         for item in &plan.items {
-            let Some(expected) = baseline.get(&item.target_path) else {
-                continue;
-            };
-            if FileStore.file_hash(context, &item.target_path)? != *expected {
-                return Err(BackendError::new(
-                    "WORKFLOW_INPUT_BASELINE_CHANGED",
-                    "A planned Wiki target changed before generation. Start a new update.",
-                    true,
-                    true,
-                ));
-            }
-            let source = context.resolve_project_path(&item.target_path)?;
-            let destination = workspace.join(&item.target_path);
-            if !destination.is_file() {
-                copy_workspace_file(&source, &destination)?;
+            for path in std::iter::once(&item.target_path).chain(&item.affected_existing_pages) {
+                if !is_safe_wiki_markdown(path) {
+                    return Err(BackendError::new(
+                        "COMPILE_INPUT_PATH_INVALID",
+                        "Planned context must be an ordinary Wiki page, not a protected Source.",
+                        true,
+                        true,
+                    ));
+                }
+                let Some(expected) = baseline.get(path) else {
+                    continue;
+                };
+                if FileStore.file_hash(context, path)? != *expected {
+                    return Err(BackendError::new(
+                        "WORKFLOW_INPUT_BASELINE_CHANGED",
+                        "A planned Wiki context page changed before generation. Start a new update.",
+                        true,
+                        true,
+                    ));
+                }
+                let source = context.resolve_project_path(path)?;
+                let destination = workspace.join(path);
+                if !destination.is_file() {
+                    copy_workspace_file(&source, &destination)?;
+                }
             }
         }
         Ok(())
@@ -1048,6 +1143,17 @@ impl CompileService {
                 &workspace.join(&source.workspace_path),
             )?;
         }
+        let catalog = sources.iter().map(|source| WorkspaceSourceInput {
+            registry_source_id: source.reference.source_id.clone(),
+            version_id: source.reference.version_id.clone(),
+            content_hash: source.reference.content_hash.clone(),
+            path: source.workspace_path.clone(),
+        }).collect::<Vec<_>>();
+        let catalog_path = workspace.join(WORKSPACE_SOURCE_INPUTS);
+        let catalog_text = serde_json::to_string_pretty(&catalog)
+            .map_err(|error| BackendError::new("COMPILE_WORKSPACE_FAILED", error.to_string(), true, false))?;
+        std::fs::write(&catalog_path, catalog_text)
+            .map_err(|error| io_error("COMPILE_WORKSPACE_FAILED", error, &catalog_path))?;
         let mut indexed_targets = HashSet::new();
         for structural in [
             context
@@ -3734,6 +3840,88 @@ mod tests {
             Some("no_extracted_markdown")
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn prompt_rejects_source_catalog_path_outside_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("purpose.md"), "# Purpose").unwrap();
+        fs::write(workspace.join("schema.md"), "# Schema").unwrap();
+        fs::write(root.path().join("outside.md"), "private outside content").unwrap();
+        let catalog = vec![WorkspaceSourceInput {
+            registry_source_id: "source".into(),
+            version_id: "version".into(),
+            content_hash: "hash".into(),
+            path: "../outside.md".into(),
+        }];
+        fs::write(workspace.join(WORKSPACE_SOURCE_INPUTS), serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let error = CompileService::provider_plan_prompt(&workspace, "zh-CN").expect_err("catalog must not read outside candidate workspace");
+        assert_eq!(error.code, "COMPILE_INPUT_PATH_INVALID");
+    }
+
+    #[test]
+    fn related_context_rejects_unselected_protected_source_before_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("wiki/sources")).unwrap();
+        let secret = "wiki/sources/secret.md";
+        fs::write(root.path().join(secret), "unselected private Source").unwrap();
+        let context = ProjectContext::new("project", root.path().to_path_buf());
+        let baseline = CompileService::snapshot_wiki(&context).unwrap();
+        let plan = CompilePlan {
+            summary: "new page".into(),
+            items: vec![CompilePlanItem {
+                action: CompileAction::Create,
+                target_path: "wiki/concepts/new.md".into(),
+                page_type: CompilePageType::Concept,
+                source_ids: vec![],
+                affected_existing_pages: vec![secret.into()],
+                reason: "related context".into(),
+                risk_flags: vec![],
+            }],
+            global_risk_flags: vec![],
+            source_decisions: vec![],
+        };
+        let error = CompileService::ensure_plan_target_context(
+            &context, workspace.path(), &plan, &baseline,
+        ).expect_err("protected Source must be rejected before copying");
+        assert_eq!(error.code, "COMPILE_INPUT_PATH_INVALID");
+        assert!(!workspace.path().join(secret).exists());
+    }
+
+    #[test]
+    fn plan_prompt_includes_selected_compatible_source_and_version() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("raw/sources/中文 收藏")).unwrap();
+        fs::create_dir_all(root.path().join("wiki")).unwrap();
+        fs::write(root.path().join("purpose.md"), "# Purpose").unwrap();
+        fs::write(root.path().join("schema.md"), "# Schema").unwrap();
+        let source_path = "raw/sources/中文 收藏/资料.md";
+        fs::write(root.path().join(source_path), "# 兼容来源\n\n编译必须读取这条事实").unwrap();
+        fs::write(root.path().join("raw/sources/中文 收藏/未选中.md"), "不要泄漏未选中来源").unwrap();
+        let context = ProjectContext::new("project", root.path().to_path_buf());
+        let source = ResolvedCompileSource {
+            reference: SourceVersionRef {
+                source_id: "selected-compatible-source".into(),
+                version_id: "selected-compatible-version".into(),
+                content_hash: "frozen-source-hash".into(),
+            },
+            project_path: source_path.into(),
+            workspace_path: source_path.into(),
+            absolute_path: root.path().join(source_path),
+            already_consumed: false,
+            registry: CompileSourceRegistry::V2,
+        };
+        let workspace = CompileService::create_workspace_for_sources(&context, "compatible-test", &[source]).unwrap();
+        let prompt = CompileService::provider_plan_prompt(&workspace, "zh-CN").unwrap();
+        assert!(prompt.contains("编译必须读取这条事实"), "selected compatible Source body was omitted");
+        assert!(prompt.contains(source_path));
+        assert!(prompt.contains("selected-compatible-source"));
+        assert!(prompt.contains("selected-compatible-version"));
+        assert!(!prompt.contains("不要泄漏未选中来源"));
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

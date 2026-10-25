@@ -974,6 +974,7 @@ fn start_temporary_preview_items(
             recovery_action: request.recovery_action.clone(),
             batch_operation: None,
             preview_only: true,
+            input_guard: None,
         })
         .collect();
     enqueue_import_jobs(jobs, DEFAULT_IMPORT_WORKER_LIMIT);
@@ -1133,6 +1134,7 @@ pub(crate) fn start_import_items_for_state(
             recovery_action: recovery_action.clone(),
             batch_operation: None,
             preview_only: false,
+            input_guard: None,
         });
         tasks.push(task);
     }
@@ -1140,15 +1142,20 @@ pub(crate) fn start_import_items_for_state(
     Ok(tasks)
 }
 
-pub fn start_import_batch_v2(
+pub fn start_import_batch_v2(app:AppHandle,state:State<'_,AppState>,request:StartImportBatchV2Request)->Result<BackendTask,BackendError>{
+    start_import_batch_with_guard(app,state,request,None)
+}
+pub(crate) fn start_import_batch_with_guard(
     app: AppHandle,
     state: State<'_, AppState>,
     request: StartImportBatchV2Request,
+    guard:Option<crate::services::import_v2::file_discovery::ImportInputGuard>,
 ) -> Result<BackendTask, BackendError> {
     let project_id = request.project_id.clone();
     let project_root_path = request.project_root_path.clone();
     state.with_current_project_write_access(&project_id, &project_root_path, |permit, _context| {
-        start_import_batch_for_state(app, &state, permit, request)
+        let task=state.import_v2_service.create_batch_operation_task_authorized(permit,&state.file_store,&state.task_service,&request.session_id,&request.item_ids)?;
+        dispatch_claimed_import_batch_with_guard(app,&state,permit,request,task,guard)
     })
 }
 
@@ -1170,12 +1177,16 @@ pub(crate) fn start_import_batch_for_state(
     dispatch_claimed_import_batch_for_state(app, state, permit, request, task)
 }
 
-pub(crate) fn dispatch_claimed_import_batch_for_state(
+pub(crate) fn dispatch_claimed_import_batch_for_state(app:AppHandle,state:&AppState,permit:&ProjectWritePermit<'_>,request:StartImportBatchV2Request,task:BackendTask)->Result<BackendTask,BackendError>{
+    dispatch_claimed_import_batch_with_guard(app,state,permit,request,task,None)
+}
+pub(crate) fn dispatch_claimed_import_batch_with_guard(
     app: AppHandle,
     state: &AppState,
     permit: &ProjectWritePermit<'_>,
     request: StartImportBatchV2Request,
     task: BackendTask,
+    guard:Option<crate::services::import_v2::file_discovery::ImportInputGuard>,
 ) -> Result<BackendTask, BackendError> {
     let context = permit.context();
     let running_task = match state
@@ -1318,6 +1329,7 @@ pub(crate) fn dispatch_claimed_import_batch_for_state(
                                 recovery_action: request.recovery_action.clone(),
                                 batch_operation: Some(operation.clone()),
                                 preview_only: false,
+                                input_guard: guard.clone(),
                             })
                             .collect::<Vec<_>>();
                         // The atomic claim completes before enqueue, so failed or cancelled

@@ -29,6 +29,7 @@ const MEDIA_CONFIRMATION_BYTES: u64 = 64 * 1024 * 1024;
 const MEDIA_WORKING_SPACE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DISCOVERY_BATCH_SIZE: usize = 128;
 
+pub(crate) type ImportInputGuard = std::sync::Arc<dyn Fn(&ImportInput)->Result<(),BackendError>+Send+Sync>;
 #[derive(Default)]
 pub struct FileDiscoveryService;
 
@@ -38,12 +39,29 @@ impl FileDiscoveryService {
         context: &ProjectContext,
         roots: &[PathBuf],
         policy: FileScanPolicy,
-        mut on_batch: B,
+        on_batch: B,
         is_cancelled: C,
     ) -> Result<FileScanResult, BackendError>
     where
         B: FnMut(&[DiscoveredFile]),
         C: Fn() -> bool,
+    {
+        self.scan_with_guard(context, roots, policy, on_batch, is_cancelled, |_| Ok(()))
+    }
+
+    pub(crate) fn scan_with_guard<B, C, G>(
+        &self,
+        context: &ProjectContext,
+        roots: &[PathBuf],
+        policy: FileScanPolicy,
+        mut on_batch: B,
+        is_cancelled: C,
+        guard: G,
+    ) -> Result<FileScanResult, BackendError>
+    where
+        B: FnMut(&[DiscoveredFile]),
+        C: Fn() -> bool,
+        G: Fn(&Path) -> Result<(), BackendError>,
     {
         let project_root = fs::canonicalize(&context.root).ok();
         let mut queue = VecDeque::new();
@@ -129,6 +147,7 @@ impl FileDiscoveryService {
                     continue;
                 }
             };
+            guard(&canonical)?;
             if project_root
                 .as_ref()
                 .is_some_and(|root| canonical.starts_with(root))
@@ -289,6 +308,7 @@ impl FileDiscoveryService {
             enforce_file_count_limit(result.files.len(), policy.max_files)?;
             let inspected =
                 source_identity(&canonical, &metadata, &is_cancelled).and_then(|identity| {
+                    guard(&canonical)?;
                     estimate_large_data(&path, format, metadata.len())
                         .map(|estimate| (identity, estimate))
                 });
@@ -306,6 +326,7 @@ impl FileDiscoveryService {
                     continue;
                 }
             };
+            guard(&canonical)?;
             let file = DiscoveredFile {
                 source_path,
                 relative_path: relative.unwrap_or_else(|| display_name.clone()),

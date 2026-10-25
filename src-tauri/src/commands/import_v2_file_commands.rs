@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc,Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
@@ -131,12 +131,18 @@ pub struct DiscardImportScanV2Request {
 
 /// Starts durable discovery work and returns immediately. The existing
 /// synchronous command remains for compatibility with older frontends.
-pub fn start_add_import_paths_v2(
+pub fn start_add_import_paths_v2(app:AppHandle,request:AddImportPathsV2Request)->Result<BackendTask,BackendError>{
+    start_add_import_paths_with_guard(app,request,None)
+}
+pub(crate) type DiscoveryPathGuard = Arc<dyn Fn(&std::path::Path)->Result<(),BackendError>+Send+Sync>;
+pub(crate) fn start_add_import_paths_with_guard(
     app: AppHandle,
     request: AddImportPathsV2Request,
+    guard:Option<DiscoveryPathGuard>,
 ) -> Result<BackendTask, BackendError> {
     let state = app.state::<AppState>();
     if crate::commands::import_v2_commands::is_temporary_preview_session(&request.session_id) {
+        if guard.is_some(){return Err(BackendError::new("API_PREVIEW_UNSUPPORTED","API discovery requires a trusted project-backed session.",true,true));}
         return start_temporary_preview_discovery(app, request);
     }
     let task = state.with_current_project_write_access(
@@ -227,7 +233,7 @@ pub fn start_add_import_paths_v2(
                 .collect::<Vec<_>>();
             let mut discovered = 0_u64;
             let mut last_progress = Instant::now() - DISCOVERY_PROGRESS_MIN_INTERVAL;
-            let mut scan = FileDiscoveryService::default().scan(
+            let mut scan = FileDiscoveryService::default().scan_with_guard(
                 &context,
                 &roots,
                 FileScanPolicy::default(),
@@ -244,6 +250,7 @@ pub fn start_add_import_paths_v2(
                     }
                 },
                 || state.task_service.is_cancelled(&task_id),
+                |path| match &guard {Some(guard)=>guard(path),None=>Ok(())},
             )?;
             if state.task_service.is_cancelled(&task_id) {
                 return Ok(());
@@ -319,7 +326,7 @@ pub fn start_add_import_paths_v2(
                         .write_json_atomic(context, &scan_path, &scan)?;
                     let operation_reference = if let Some(operation) = accepted_operation {
                         let item_count = operation.item_ids.len() as u64;
-                        let operation_task = crate::commands::import_v2_commands::dispatch_claimed_import_batch_for_state(
+                        let operation_task = crate::commands::import_v2_commands::dispatch_claimed_import_batch_with_guard(
                             app.clone(),
                             &state,
                             permit,
@@ -331,6 +338,15 @@ pub fn start_add_import_paths_v2(
                                 recovery_action: None,
                             },
                             operation.task,
+                            guard.as_ref().map(|path_guard| {let path_guard=path_guard.clone();Arc::new(move|input:&crate::models::import_v2::ImportInput| {
+                                if input.kind==crate::models::import_v2::ImportInputKind::Folder{return Err(BackendError::new("API_FOLDER_PARSE_UNSUPPORTED","Discover individual files through the scoped /paths flow.",true,true));}
+                                if input.kind==crate::models::import_v2::ImportInputKind::File {
+                                    path_guard(std::path::Path::new(&input.locator))?;
+                                    if let Some(path)=&input.normalized_locator{path_guard(std::path::Path::new(path))?;}
+                                    if let Some(identity)=&input.source_identity{path_guard(std::path::Path::new(&identity.canonical_path))?;}
+                                }
+                                Ok(())
+                            }) as crate::services::import_v2::file_discovery::ImportInputGuard}),
                         )?;
                         Some(TaskResultReference::ImportOperation {
                             session_id: request.session_id.clone(),
@@ -559,10 +575,14 @@ pub fn get_import_scan_result_v2(
     state.file_store.read_json(&context, &path)
 }
 
-pub fn accept_import_scan_v2(
+pub fn accept_import_scan_v2(app:AppHandle,state:State<'_,AppState>,request:AcceptImportScanV2Request)->Result<AcceptImportScanV2Result,BackendError>{
+    accept_import_scan_with_guard(app,state,request,None)
+}
+pub(crate) fn accept_import_scan_with_guard(
     app: AppHandle,
     state: State<'_, AppState>,
     request: AcceptImportScanV2Request,
+    input_guard:Option<crate::services::import_v2::file_discovery::ImportInputGuard>,
 ) -> Result<AcceptImportScanV2Result, BackendError> {
     let _guard = import_scan_confirmation_lock().lock().map_err(|_| {
         BackendError::new(
@@ -713,7 +733,7 @@ pub fn accept_import_scan_v2(
                 .map_or(0, |operation| operation.item_ids.len() as u64);
             let operation_task = if let Some(operation) = accepted_operation {
                 Some(
-                    crate::commands::import_v2_commands::dispatch_claimed_import_batch_for_state(
+                    crate::commands::import_v2_commands::dispatch_claimed_import_batch_with_guard(
                         app.clone(),
                         &state,
                         permit,
@@ -725,6 +745,7 @@ pub fn accept_import_scan_v2(
                             recovery_action: None,
                         },
                         operation.task,
+                        input_guard.clone(),
                     )?,
                 )
             } else {

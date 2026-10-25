@@ -43,6 +43,7 @@ pub(crate) struct ImportWorkerJob {
     pub(crate) recovery_action: Option<ImportRecoveryAction>,
     pub(crate) batch_operation: Option<BatchOperationJob>,
     pub(crate) preview_only: bool,
+    pub(crate) input_guard: Option<crate::services::import_v2::file_discovery::ImportInputGuard>,
 }
 
 #[derive(Clone)]
@@ -443,6 +444,7 @@ fn run_import_worker_job(job: &ImportWorkerJob) {
             }
             return Ok(false);
         }
+        if let Some(guard)=&job.input_guard {guard(&job.snapshot.input)?;}
         if job.preview_only {
             state.import_v2_service.run_temporary_preview_item(
                 &context,

@@ -63,6 +63,63 @@ struct SuccessfulAgent {
     delete_path: Option<String>,
 }
 
+#[derive(Default)]
+struct PageBoundedAgent {
+    targets: std::sync::Mutex<Vec<String>>,
+}
+
+impl ProcessRunner for PageBoundedAgent {
+    fn find_executable(&self, command: &str) -> Option<PathBuf> {
+        SuccessfulAgent { delete_path: None }.find_executable(command)
+    }
+
+    fn run_with_timeout(
+        &self,
+        command: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<String, BackendError> {
+        SuccessfulAgent { delete_path: None }.run_with_timeout(command, args, timeout)
+    }
+
+    fn run_capture(&self, invocation: &AgentInvocation) -> Result<(String, String), BackendError> {
+        SuccessfulAgent { delete_path: None }.run_capture(invocation)
+    }
+
+    fn run_task_streaming(
+        &self,
+        invocation: &AgentInvocation,
+        _tasks: &TaskService,
+        _task_id: &str,
+    ) -> Result<String, BackendError> {
+        let prompt = invocation.stdin.as_deref().unwrap();
+        let raw = SuccessfulAgent { delete_path: None }.structured_output(invocation)?;
+        if !prompt.contains("--- Accepted CompilePlan ---") {
+            return Ok(raw);
+        }
+        let target = prompt
+            .lines()
+            .find_map(|line| line.strip_prefix("Generate only `")?.split('`').next())
+            .ok_or_else(|| {
+                BackendError::new(
+                    "IMPORT_AGENT_TIMEOUT",
+                    "This provider can finish one page per response, not an entire Wiki manifest.",
+                    true,
+                    true,
+                )
+            })?;
+        assert_ne!(
+            target, "wiki/log.md",
+            "history log must be appended without a model call"
+        );
+        self.targets.lock().unwrap().push(target.to_string());
+        let mut manifest: CompileManifest = serde_json::from_str(&raw).unwrap();
+        manifest.files.retain(|file| file.path == target);
+        assert_eq!(manifest.files.len(), 1, "unknown page requested");
+        Ok(serde_json::to_string(&manifest).unwrap())
+    }
+}
+
 struct DeferredSourceAgent;
 
 impl ProcessRunner for DeferredSourceAgent {
@@ -119,7 +176,7 @@ impl SuccessfulAgent {
             .as_deref()
             .is_some_and(|prompt| prompt.contains("--- Accepted CompilePlan ---"))
         {
-            return Ok(serde_json::json!({
+            let mut manifest = serde_json::json!({
                 "summary": "update wiki",
                 "files": [
                     { "path": "wiki/index.md", "content": "# Index\n- [[concepts/工作流成功]]\n" },
@@ -128,8 +185,23 @@ impl SuccessfulAgent {
                     { "path": target, "content": "---\ntype: concept\nsources:\n  - 资料.md\n---\n# 工作流成功\n\n> Sources: [资料](../sources/资料.md)\n" }
                 ],
                 "deletions": self.delete_path.clone().into_iter().collect::<Vec<_>>()
-            })
-            .to_string());
+            });
+            if let Some(requested) = invocation
+                .stdin
+                .as_deref()
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("Generate only `")?.split('`').next())
+            {
+                manifest["files"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|file| file["path"] == requested);
+                if requested != target {
+                    manifest["deletions"] = serde_json::json!([]);
+                }
+            }
+            return Ok(manifest.to_string());
         }
         serde_json::to_string(&CompilePlan {
             summary: "update wiki".into(),
@@ -975,6 +1047,69 @@ fn low_risk_update_uses_hash_checked_apply_and_never_overwrites_late_edit() {
     assert_eq!(
         fs::read_to_string(context.wiki_dir.join("index.md")).unwrap(),
         "# User edit\n"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn agent_page_batches_complete_without_requesting_an_entire_manifest() {
+    let (context, root) = project("page-bounded-agent");
+    let (scope, expected_source) = source_scope(&context);
+    let baseline_log = "---\nsource_versions: [historical-version]\nchat_session: historical-chat\n---\n# Log\nHistorical citation must survive.";
+    fs::write(context.wiki_dir.join("log.md"), baseline_log).unwrap();
+    GitService
+        .initialize_repository(&context, "initial")
+        .unwrap();
+    let runner = Arc::new(PageBoundedAgent::default());
+    let harness = UpdateHarness::new(runner.clone());
+    let run = enqueue_update(
+        &context,
+        &harness.tasks,
+        &harness.coordinator,
+        UpdateWikiMode::ChangedSources,
+        scope,
+    );
+    run_update_wiki(&context, run.clone(), &harness.services()).await;
+    let completed = harness.tasks.get_workflow_run(&run.task_id).unwrap();
+    assert_eq!(
+        completed.display_status,
+        WorkflowDisplayStatus::Completed,
+        "page-bounded generation must still pass the real workflow: {:?}",
+        completed.error
+    );
+    let targets = runner.targets.lock().unwrap();
+    assert_eq!(targets.len(), 3);
+    assert_eq!(
+        targets.iter().cloned().collect::<HashSet<_>>(),
+        HashSet::from([
+            "wiki/concepts/工作流成功.md".to_string(),
+            "wiki/index.md".to_string(),
+            "wiki/overview.md".to_string(),
+        ])
+    );
+    let record = fs::read_to_string(
+        context
+            .app_dir
+            .join("compile")
+            .join(format!("{}.json", run.task_id)),
+    )
+    .unwrap();
+    let record: CompileConsumptionRecord = serde_json::from_str(&record).unwrap();
+    assert_eq!(record.source_versions, vec![expected_source]);
+    let log = fs::read_to_string(context.wiki_dir.join("log.md")).unwrap();
+    assert!(log.starts_with(baseline_log));
+    assert_eq!(log.matches("### Update Wiki candidate record").count(), 1);
+    assert!(log.contains("not consumption"));
+    let Some(llm_wiki_desktop_lib::models::workflow::WorkflowResult::UpdateWiki {
+        final_commit: Some(final_commit),
+        ..
+    }) = completed.result
+    else {
+        panic!("real final commit required");
+    };
+    assert_eq!(
+        GitService::file_at_checkpoint(&context, &final_commit, "wiki/log.md").unwrap(),
+        Some(log)
     );
     fs::remove_dir_all(root).ok();
 }
@@ -2372,6 +2507,83 @@ async fn regression_full_recompile_consumed_v2_publishes_new_consumption() {
     assert_eq!(fs::read(&metadata_path).unwrap(), before);
 }
 
+struct RelatedContextAgent;
+
+impl ProcessRunner for RelatedContextAgent {
+    fn find_executable(&self, command: &str) -> Option<PathBuf> {
+        SuccessfulAgent { delete_path: None }.find_executable(command)
+    }
+    fn run_with_timeout(
+        &self,
+        command: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<String, BackendError> {
+        SuccessfulAgent { delete_path: None }.run_with_timeout(command, args, timeout)
+    }
+    fn run_capture(&self, invocation: &AgentInvocation) -> Result<(String, String), BackendError> {
+        SuccessfulAgent { delete_path: None }.run_capture(invocation)
+    }
+    fn run_task_streaming(
+        &self,
+        invocation: &AgentInvocation,
+        _tasks: &TaskService,
+        _task_id: &str,
+    ) -> Result<String, BackendError> {
+        let raw = SuccessfulAgent { delete_path: None }.structured_output(invocation)?;
+        if invocation
+            .stdin
+            .as_deref()
+            .unwrap()
+            .contains("--- Accepted CompilePlan ---")
+        {
+            return Ok(raw);
+        }
+        let mut plan: CompilePlan = serde_json::from_str(&raw).unwrap();
+        plan.items[0].affected_existing_pages = vec!["wiki/concepts/未输出关联页.md".into()];
+        plan.items[0].risk_flags = vec!["broad rewrite".into()];
+        Ok(serde_json::to_string(&plan).unwrap())
+    }
+}
+
+#[tokio::test]
+async fn late_added_related_context_keeps_its_original_review_input_baseline() {
+    let (context, root) = project("late-related-context");
+    let related = root.join("wiki/concepts/未输出关联页.md");
+    fs::write(&related, "# Related baseline\n").unwrap();
+    GitService
+        .initialize_repository(&context, "initial")
+        .unwrap();
+    let (scope, _) = source_scope(&context);
+    let harness = UpdateHarness::new(Arc::new(RelatedContextAgent));
+    let run = enqueue_update(
+        &context,
+        &harness.tasks,
+        &harness.coordinator,
+        UpdateWikiMode::ChangedSources,
+        scope,
+    );
+    run_update_wiki(&context, run.clone(), &harness.services()).await;
+    let waiting = harness.tasks.get_workflow_run(&run.task_id).unwrap();
+    assert_eq!(
+        waiting.display_status,
+        WorkflowDisplayStatus::WaitingForConfirmation,
+        "{:?}",
+        waiting.error
+    );
+    fs::write(&related, "# External edit after generation\n").unwrap();
+    assert!(!update_wiki_candidate_is_valid(&run.task_id, &root));
+    let failure =
+        confirm_update_wiki_review(&context, &run.task_id, &harness.services()).unwrap_err();
+    assert_eq!(failure.error.code, "WORKFLOW_INPUT_BASELINE_CHANGED");
+    assert_eq!(
+        fs::read_to_string(&related).unwrap(),
+        "# External edit after generation\n"
+    );
+    assert!(!root.join("wiki/concepts/工作流成功.md").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
 struct HistoricalSourceAgent;
 impl ProcessRunner for HistoricalSourceAgent {
     fn find_executable(&self, command: &str) -> Option<PathBuf> {
@@ -2400,16 +2612,27 @@ impl ProcessRunner for HistoricalSourceAgent {
             .as_deref()
             .is_some_and(|prompt| prompt.contains("--- Accepted CompilePlan ---"))
         {
-            assert!(invocation
+            let requested = invocation
                 .stdin
                 .as_deref()
                 .unwrap()
-                .contains("# Historical original evidence"));
-            assert!(invocation
-                .stdin
-                .as_deref()
-                .unwrap()
-                .contains("wiki/sources/local/article_39.md"));
+                .lines()
+                .find_map(|line| line.strip_prefix("Generate only `")?.split('`').next());
+            if requested
+                .map(|path| !matches!(path, "wiki/index.md" | "wiki/overview.md" | "wiki/log.md"))
+                .unwrap_or(true)
+            {
+                assert!(invocation
+                    .stdin
+                    .as_deref()
+                    .unwrap()
+                    .contains("# Historical original evidence"));
+                assert!(invocation
+                    .stdin
+                    .as_deref()
+                    .unwrap()
+                    .contains("wiki/sources/local/article_39.md"));
+            }
             let mut manifest: CompileManifest = serde_json::from_str(&raw).unwrap();
             for file in &mut manifest.files {
                 if file.path == "wiki/concepts/工作流成功.md" {

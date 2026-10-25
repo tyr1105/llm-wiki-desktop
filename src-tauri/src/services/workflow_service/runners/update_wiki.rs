@@ -293,6 +293,19 @@ where
                 .filter(|(path, _)| !output_paths.contains(path.as_str()))
                 .map(|(path, hash)| (path.clone(), hash.clone())),
         );
+        // Planning may add related pages omitted by the initial relevance filter.
+        // Bind read-only context to its original hash, never a post-generation read.
+        for path in candidate
+            .plan
+            .items
+            .iter()
+            .flat_map(|item| &item.affected_existing_pages)
+            .filter(|path| !output_paths.contains(path.as_str()))
+        {
+            if let Some(hash) = wiki_baseline.get(path) {
+                input_baseline.insert(path.clone(), Some(hash.clone()));
+            }
+        }
         for outcome in &candidate.source_outcomes {
             if outcome.status == crate::models::compile::CompileSourceOutcomeStatus::AlreadyCovered
             {
@@ -1259,15 +1272,7 @@ fn apply_persisted_update_wiki_candidate(
     sink.complete(REVIEW_RISK).map_err(task_error)?;
     sink.start(APPLY_CHANGES).map_err(task_error)?;
 
-    let mut metadata_paths = vec![format!(".app/compile/{task_id}.json")];
-    metadata_paths.extend(
-        descriptor
-            .candidate
-            .consumed_source_versions()
-            .iter()
-            .filter(|reference| !reference.source_id.starts_with("legacy-"))
-            .map(|reference| format!(".app/sources/{}.json", reference.source_id)),
-    );
+    let metadata_paths = compile_output_backup_paths(context, task_id, &descriptor.candidate.consumed_source_versions())?;
     let mut backup = CompileService::backup_workflow_outputs(
         context,
         &descriptor.candidate.manifest,
@@ -1342,7 +1347,7 @@ fn apply_persisted_update_wiki_candidate(
         }
     };
     let mut rollback_paths = affected_paths.clone();
-    rollback_paths.push(".app/graph-cache.json".into());
+    rollback_paths.push(workflow_graph_cache_relative_path(context));
     rollback_paths.extend(metadata_paths.iter().cloned());
     let reversible_finalize = (|| {
         sink.progress(
@@ -1483,6 +1488,27 @@ fn current_manifest_hashes(
     Ok(hashes)
 }
 
+fn compile_metadata_paths(
+    context: &ProjectContext,
+    task_id: &str,
+    sources: &[SourceVersionRef],
+) -> Result<Vec<String>, BackendError> {
+    let mut paths = vec![format!(".app/compile/{task_id}.json")];
+    let source_paths = context.layout.source_paths()?;
+    for source in sources.iter().filter(|source| !source.source_id.starts_with("legacy-")) {
+        paths.push(source_paths.manifest(&source.source_id)?);
+    }
+    Ok(paths)
+}
+
+fn compile_output_backup_paths(context: &ProjectContext, task_id: &str, sources: &[SourceVersionRef]) -> Result<Vec<String>, BackendError> {
+    let mut paths = compile_metadata_paths(context, task_id, sources)?;
+    paths.push(workflow_graph_cache_relative_path(context));
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn checkpoint_reviewed_inputs(
     context: &ProjectContext,
     run: &WorkflowRun,
@@ -1513,15 +1539,7 @@ fn checkpoint_reviewed_inputs(
         &paths,
         Some(&descriptor.current_hashes),
     )?;
-    paths = vec![format!(".app/compile/{}.json", run.task_id)];
-    paths.extend(
-        descriptor
-            .candidate
-            .consumed_source_versions()
-            .iter()
-            .filter(|source| !source.source_id.starts_with("legacy-"))
-            .map(|source| format!(".app/sources/{}.json", source.source_id)),
-    );
+    paths = compile_metadata_paths(context, &run.task_id, &descriptor.candidate.consumed_source_versions())?;
     let metadata_before = services
         .git_service
         .capture_history_files(context, &paths, None)?;
@@ -2711,6 +2729,38 @@ mod real_route_acceptance;
 mod batch6_diff_summary_tests {
     use super::*;
     use crate::models::compile::CompileRoute;
+
+    #[test]
+    fn compatible_graph_cache_is_restored_after_refreshed_workflow_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let mut context = ProjectContext::new("compatible-graph-rollback", root.path().to_path_buf());
+        context.layout.app_state_root = Some(".app/compat".into());
+        context.layout.source_state_root = Some(".app/compat/sources".into());
+        let graph = workflow_graph_cache_relative_path(&context);
+        FileStore.write_markdown(&context, &graph, "baseline graph").unwrap();
+        let manifest = CompileManifest { files: vec![], deletions: vec![], summary: "metadata only".into() };
+        let extra = compile_output_backup_paths(&context, "task-1", &[]).unwrap();
+        let mut backup = CompileService::backup_workflow_outputs(&context, &manifest, &extra).unwrap();
+        FileStore.write_markdown(&context, &graph, "workflow graph").unwrap();
+        CompileService::capture_workflow_installed_values(&context, &mut backup, std::slice::from_ref(&graph)).unwrap();
+        CompileService::restore_workflow_outputs_if_unchanged(&context, &backup, &manifest, std::slice::from_ref(&graph)).unwrap();
+        assert_eq!(FileStore.read_markdown(&context, &graph).unwrap(), "baseline graph");
+    }
+
+    #[test]
+    fn compatible_metadata_snapshot_uses_registry_path_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let mut context = ProjectContext::new("compatible-metadata", root.path().to_path_buf());
+        context.layout.app_state_root = Some(".app/compat".into());
+        context.layout.source_state_root = Some(".app/compat/sources".into());
+        let source = SourceVersionRef { source_id: "source-1".into(), version_id: "version-1".into(), content_hash: "a".repeat(64) };
+        let registry_path = context.layout.source_paths().unwrap().manifest(&source.source_id).unwrap();
+        FileStore.write_markdown(&context, &registry_path, "source metadata before apply").unwrap();
+        let paths = compile_metadata_paths(&context, "task-1", &[source]).unwrap();
+        let before = GitService.capture_history_files(&context, &paths, None).unwrap();
+        assert_eq!(before.get(&registry_path), Some(&Some(b"source metadata before apply".to_vec())));
+        assert!(!before.contains_key(".app/sources/source-1.json"));
+    }
 
     #[test]
     fn newly_created_compatible_guidance_invalidates_input_snapshot() {
