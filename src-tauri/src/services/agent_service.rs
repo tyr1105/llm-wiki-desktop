@@ -2224,7 +2224,15 @@ fn agent_failure_category(message: &str) -> &'static str {
         "context_limit"
     } else if text.contains("invalid_api_key") || text.contains("unexpected status 401") || text.contains("unexpected status 403") {
         "authentication_or_access"
-    } else if text.contains("insufficient_quota") || text.contains("usage_limit_reached") {
+    } else if text.contains("insufficient_quota")
+        || text.contains("usage_limit_reached")
+        // V8：codex exec 在 ChatGPT 订阅额度用完时，error / turn.failed 事件的 message 是
+        // 给人看的一句话 "You've hit your usage limit. Upgrade to ... or try again at ..."
+        // （2026-10-24 实测），
+        // 里面没有 usage_limit_reached 这个错误码，V7 会把它归成 unclassified，重试脚本
+        // 就把它当"秒败"退还次数。这里只匹配撇号之后的固定片段，直撇号 ' 和弯撇号 ’ 都能命中。
+        || text.contains("hit your usage limit")
+    {
         "quota_limit"
     } else if text.contains("rate_limit_exceeded") || text.contains("unexpected status 429") {
         "rate_limit"
@@ -2238,6 +2246,117 @@ fn agent_failure_category(message: &str) -> &'static str {
         "upstream_unavailable"
     } else {
         "unclassified"
+    }
+}
+
+/// V8：Claude 命令行（stream-json）失败时的分类。
+///
+/// 为什么需要单独一个函数：Claude 的超限、拦截、用量上限、未登录这些报错，都不会发
+/// `error` / `turn.failed` 事件，而是用最后一个 `result` 事件返回——
+/// `is_error: true`，外加 `terminal_reason`、`api_error_status` 和 `result` 文本。例如
+/// 2026-10-25 实测（claude 2.1.259）：
+/// `{"type":"result","subtype":"success","is_error":true,"api_error_status":400,
+///   "terminal_reason":"prompt_too_long","result":"Prompt is too long · the request is ~1393966 tokens (limit 1000000) ..."}`。
+/// V7 只对 `error` 类事件调用 `agent_failure_category`，所以 Claude 的失败全部是
+/// `unclassified`，重试脚本分不清"上下文超限""额度用完""要重新登录"和普通失败。
+///
+/// 只由解析器在 `is_error == true` 的 result 事件上调用；返回值和
+/// `agent_failure_category` 一样只是固定标签，绝不把 result 原文写进错误详情。
+///
+/// 判断顺序（先看结构化字段，再看文本，最后看状态码）：
+/// 1. `terminal_reason` 是 `prompt_too_long` / `blocking_limit` / `rapid_refill_breaker`
+///    → `context_limit`。这三个值正是 claude 2.1.259 自己归为 "context_limit" 的终止原因
+///    （二进制里的映射函数原样如此）：前两个分别是"API 说提示太长"和"本地按模型窗口直接拦下"，
+///    第三个是"自动压缩连续失败的熔断"，本质都是上下文装不下。
+/// 2. `result` 文本（subtype=success 时）或 `errors` 数组（error_* 子类型时）
+///    → 交给 `claude_error_text_category` 判断额度 / 登录 / 提示过长。
+/// 3. `api_error_status` 为 401 → `auth_required`（凭据无效或过期，需要重新登录）。
+/// 4. 其余（比如 500、普通 400、max_turns）一律保持 `unclassified`，不猜。
+fn claude_result_failure_category(event: &serde_json::Value) -> &'static str {
+    if let Some("prompt_too_long" | "blocking_limit" | "rapid_refill_breaker") = event
+        .get("terminal_reason")
+        .and_then(serde_json::Value::as_str)
+    {
+        return "context_limit";
+    }
+    // result 只在 subtype=success 时出现；error_during_execution 等子类型把原因放在 errors 数组里。
+    let result_text = event.get("result").and_then(serde_json::Value::as_str);
+    let error_texts = event
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+    for text in result_text.into_iter().chain(error_texts) {
+        if let Some(category) = claude_error_text_category(text) {
+            return category;
+        }
+    }
+    if event
+        .get("api_error_status")
+        .and_then(serde_json::Value::as_i64)
+        == Some(401)
+    {
+        return "auth_required";
+    }
+    "unclassified"
+}
+
+/// V8：按 Claude 命令行给人看的那一行报错文字分类，认不出就返回 None。
+///
+/// 只看第一行：Claude 合成的报错都是一行（例如 "Not logged in · Please run /login"），
+/// 只看第一行能避免把模型正文里偶然出现的同样字眼误判成失败原因。
+/// 文字片段取自 claude 2.1.259 二进制里的原文（只读检索，没有运行它）：
+/// * 用量 / 额度上限：命令行自己判断"用量上限提示"用的前缀表，包括
+///   "You've hit your …"（如 "You've hit your limit · resets 3pm"、"You've hit your weekly limit"）、
+///   "You've reached your …"、"You're out of usage credits"、"You're out of extra usage"、
+///   "Your org is out of usage …"、"Your seat type doesn't include (extra) usage"、
+///   "Your usage allocation has been disabled by your admin"、"Your group's usage limit is set to $0"、
+///   "… requires usage credits"；另加 API Key 计费的 "Credit balance is too low"、
+///   各种 "spend limit"，以及旧版的 "Claude AI usage limit reached|<时间戳>"。
+/// * 未登录 / 认证失败："Not logged in · Please run /login"、"Invalid API key · …"、
+///   "Invalid auth token · …"、"OAuth token revoked · Please run /login"、
+///   "Login expired · Please run /login"、"Failed to authenticate. …"、
+///   API 返回的 authentication_error。
+/// * 提示过长：result 文本以 "Prompt is too long" 开头（有时 terminal_reason 缺失，
+///   例如 API 直接返回 "prompt is too long: N tokens > M maximum"）。
+fn claude_error_text_category(text: &str) -> Option<&'static str> {
+    let first_line = text.trim_start().lines().next().unwrap_or("");
+    // 统一成小写、把弯撇号 ’ 换成直撇号 '，这样 "You’ve" 和 "You've" 都能匹配。
+    let line = first_line.to_ascii_lowercase().replace('\u{2019}', "'");
+    let has = |needles: &[&str]| needles.iter().any(|needle| line.contains(needle));
+    if has(&["prompt is too long", "context_length_exceeded"]) {
+        Some("context_limit")
+    } else if has(&[
+        "you've hit your",
+        "you've reached your",
+        "usage limit reached",
+        "out of usage credits",
+        "out of extra usage",
+        "org is out of usage",
+        "doesn't include usage",
+        "doesn't include extra usage",
+        "usage allocation has been disabled",
+        "usage limit is set to $0",
+        "requires usage credits",
+        "credit balance is too low",
+        "spend limit",
+    ]) {
+        Some("quota_limit")
+    } else if has(&[
+        "not logged in",
+        "please run /login",
+        "invalid api key",
+        "invalid auth token",
+        "oauth token revoked",
+        "oauth token has expired",
+        "login expired",
+        "failed to authenticate",
+        "authentication_error",
+    ]) {
+        Some("auth_required")
+    } else {
+        None
     }
 }
 
@@ -2377,6 +2496,18 @@ impl AgentOutputParser {
                         .get("subtype")
                         .and_then(|value| value.as_str())
                         .is_none_or(|subtype| subtype == "success");
+                // V8：Claude 的失败只在这里出现（is_error=true 的 result 事件），从不走上面
+                // error/turn.failed 那条分类路径。用 terminal_reason / result 文本 /
+                // api_error_status 归类，结果写进 failure_category；进程非零退出时它会变成
+                // AGENT_EXIT_FAILED 的 details.agentFailureCategory，退出码为 0 时变成
+                // validate_terminal 报错里的同名字段。和上面一样，只在还没有更具体的分类时覆盖。
+                if value.get("is_error").and_then(serde_json::Value::as_bool) == Some(true)
+                    && self
+                        .failure_category
+                        .is_none_or(|category| category == "unclassified")
+                {
+                    self.failure_category = Some(claude_result_failure_category(&value));
+                }
             }
             "response.completed" => {
                 self.terminal_seen = true;
@@ -7258,6 +7389,255 @@ mod tests {
         assert_eq!(details["transportReason"], "unsuccessful_terminal");
         assert_eq!(details["agentFailureCategory"], "request_rejected");
         assert!(!format!("{error:?}").contains("PRIVATE_SYNTHETIC_PAYLOAD"));
+    }
+
+    // V8：2026-10-25 实测的 Claude 超限 result 事件（claude 2.1.259，--model opus，
+    // 只去掉了 usage/subagent_stats 等与分类无关的字段，
+    // session_id/uuid 换成假值）。字段顺序和取值保持原样："type":"result" 在最后。
+    const REAL_CLAUDE_PROMPT_TOO_LONG_RESULT: &str = r#"{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"synthetic-session","total_cost_usd":0,"modelUsage":{},"permission_denials":[],"terminal_reason":"prompt_too_long","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","is_error":true,"num_turns":1,"subtype":"success","api_error_status":400,"result":"Prompt is too long · the request is ~1393966 tokens (limit 1000000) but this conversation is only ~514472 tokens — the rest is system prompt, tool definitions, and attachment content. A single-exchange conversation cannot be compacted; reduce attached files/tools or start with less context.","type":"result","duration_ms":1950,"uuid":"synthetic-uuid","queued_turn_count":0}"#;
+
+    /// 把一串 stream-json 行喂给解析器，返回 validate_terminal 报错里的 agentFailureCategory
+    /// （解析成功则返回 None）。
+    fn claude_terminal_category(lines: &[&str]) -> Option<String> {
+        let mut parser = AgentOutputParser::new(true);
+        for line in lines {
+            parser.parse(line);
+            parser.validate_line().unwrap();
+        }
+        parser.validate_terminal().err().map(|error| {
+            assert_eq!(error.code, "LINT_AGENT_OUTPUT_MALFORMED");
+            let details = error.details.as_ref().unwrap();
+            assert_eq!(details["transportReason"], "unsuccessful_terminal");
+            details["agentFailureCategory"].as_str().unwrap().to_string()
+        })
+    }
+
+    // V8：Claude 的失败只通过 is_error=true 的 result 事件返回，必须按
+    // terminal_reason / result 文本 / api_error_status 归类，而不是一律 unclassified。
+    #[test]
+    fn claude_result_error_events_are_classified_from_terminal_reason_text_and_status() {
+        // 1) 上下文超限：真实的 prompt_too_long 事件，以及本地按窗口拦下的 blocking_limit
+        //    （blocking_limit 的 result 文本无关紧要，由 terminal_reason 决定）。
+        let mut real = AgentOutputParser::new(true);
+        real.parse(r#"{"type":"system","subtype":"init","cwd":"/tmp/synthetic","session_id":"synthetic-session","tools":[],"mcp_servers":[],"model":"claude-opus-5","permissionMode":"dontAsk","apiKeySource":"none","claude_code_version":"2.1.259"}"#);
+        real.parse(r#"{"type":"assistant","message":{"id":"synthetic","model":"<synthetic>","role":"assistant","type":"message","content":[{"type":"text","text":"Prompt is too long"}]}}"#);
+        real.parse(REAL_CLAUDE_PROMPT_TOO_LONG_RESULT);
+        real.validate_line().expect("a single failed result is a well-formed terminal");
+        assert_eq!(real.failure_category, Some("context_limit"));
+        let error = real.validate_terminal().unwrap_err();
+        assert_eq!(error.details.as_ref().unwrap()["agentFailureCategory"], "context_limit");
+        // 错误详情里只有固定标签，不能出现 Claude 回传的原文或 token 数。
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains("Prompt is too long"));
+        assert!(!rendered.contains("1393966"));
+
+        for (terminal_reason, status) in [
+            ("blocking_limit", "null"),
+            ("prompt_too_long", "400"),
+            ("rapid_refill_breaker", "null"),
+        ] {
+            let event = format!(
+                r#"{{"type":"result","subtype":"success","is_error":true,"terminal_reason":"{terminal_reason}","api_error_status":{status},"result":"synthetic local stop","modelUsage":{{}}}}"#
+            );
+            assert_eq!(
+                claude_terminal_category(&[event.as_str()]).as_deref(),
+                Some("context_limit"),
+                "{terminal_reason}"
+            );
+        }
+        // terminal_reason 缺失时，"Prompt is too long" 文本本身也能识别。
+        assert_eq!(
+            claude_terminal_category(&[r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":400,"result":"API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 1393966 tokens > 1000000 maximum\"}}"}"#]).as_deref(),
+            Some("context_limit")
+        );
+
+        // 2) 用量 / 额度上限 → quota_limit（文字取自 claude 2.1.259 的用量上限前缀表）。
+        for text in [
+            "You've hit your limit · resets 3pm (Asia/Singapore)",
+            "You’ve hit your weekly limit · resets Oct 31, 1:41am",
+            "You've reached your Opus limit · resets 11pm",
+            "You're out of extra usage · resets 3pm",
+            "You're out of usage credits. Run /usage-credits to keep using Claude",
+            "Your org is out of usage · contact your admin",
+            "Claude AI usage limit reached|1761843660",
+            "Credit balance is too low",
+        ] {
+            let event = serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": true,
+                "terminal_reason": "api_error",
+                "api_error_status": 429,
+                "result": text,
+            })
+            .to_string();
+            assert_eq!(
+                claude_terminal_category(&[event.as_str()]).as_deref(),
+                Some("quota_limit"),
+                "{text}"
+            );
+        }
+
+        // 3) 未登录 / 认证失败 → auth_required（文本或 401 状态码任一即可）。
+        for (text, status) in [
+            ("Not logged in · Please run /login", serde_json::Value::Null),
+            ("Invalid API key · Fix external API key", serde_json::json!(401)),
+            ("OAuth token revoked · Please run /login", serde_json::json!(401)),
+            ("Login expired · Please run /login", serde_json::Value::Null),
+            ("Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}", serde_json::json!(401)),
+            ("API Error: 401 synthetic", serde_json::json!(401)),
+        ] {
+            let event = serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": true,
+                "terminal_reason": "api_error",
+                "api_error_status": status,
+                "result": text,
+            })
+            .to_string();
+            assert_eq!(
+                claude_terminal_category(&[event.as_str()]).as_deref(),
+                Some("auth_required"),
+                "{text}"
+            );
+        }
+        // error_* 子类型没有 result 字段，原因放在 errors 数组里，同样要看。
+        assert_eq!(
+            claude_terminal_category(&[r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Not logged in · Please run /login"]}"#]).as_deref(),
+            Some("auth_required")
+        );
+
+        // 4) 其余失败保持 unclassified，不猜：服务端 500、普通 400、max_turns，
+        //    以及只在第二行以后才出现关键词的文本（可能是模型正文，不作数）。
+        for event in [
+            r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":500,"result":"API Error: 500 Internal server error"}"#,
+            r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":400,"result":"API Error: 400 invalid_request_error synthetic"}"#,
+            r#"{"type":"result","is_error":true,"subtype":"error_max_turns","result":"partial"}"#,
+            r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"model_error","result":"Model stopped.\nNot logged in · Please run /login"}"#,
+        ] {
+            assert_eq!(
+                claude_terminal_category(&[event]).as_deref(),
+                Some("unclassified"),
+                "{event}"
+            );
+        }
+    }
+
+    // V8：正常的 result（is_error=false）不受影响：照常成功、答案照常取 result 字段，
+    // 即使答案正文里恰好出现"Prompt is too long""Not logged in"这类字眼也不能被当成失败。
+    #[test]
+    fn successful_claude_result_is_not_classified_as_a_failure() {
+        let answer = r#"{"summary":"Prompt is too long · Not logged in · You've hit your limit","items":[]}"#;
+        let event = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": "completed",
+            "num_turns": 1,
+            "result": answer,
+        })
+        .to_string();
+        let mut parser = AgentOutputParser::new(true);
+        let parsed = parser.parse(&event);
+        assert_eq!(parsed.text.as_deref(), Some(answer));
+        parser.validate_terminal().expect("a normal Claude result stays successful");
+        assert_eq!(parser.failure_category, None);
+
+        // 没有 is_error 字段（旧格式）同样视为正常。
+        let mut legacy = AgentOutputParser::new(true);
+        legacy.parse(r#"{"type":"result","subtype":"success","result":"ok"}"#);
+        legacy.validate_terminal().unwrap();
+        assert_eq!(legacy.failure_category, None);
+    }
+
+    // V8：Codex 订阅额度用完时 codex exec 报的是一句给人看的话（没有 usage_limit_reached 错误码），
+    // 也要归为 quota_limit；原有的错误码匹配和其他分类保持不变。
+    #[test]
+    fn codex_usage_limit_message_is_classified_as_quota_limit() {
+        let message = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 31st, 2026 1:41 AM.";
+        let mut parser = AgentOutputParser::new(true);
+        parser.parse(&serde_json::json!({"type": "error", "message": message}).to_string());
+        parser.validate_line().unwrap();
+        parser.parse(
+            &serde_json::json!({"type": "turn.failed", "error": {"message": message}}).to_string(),
+        );
+        parser.validate_line().unwrap();
+        let error = parser.validate_terminal().unwrap_err();
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["agentFailureCategory"], "quota_limit");
+        assert!(!format!("{error:?}").contains("chatgpt.com"));
+
+        assert_eq!(agent_failure_category("You’ve hit your usage limit."), "quota_limit");
+        assert_eq!(
+            agent_failure_category("unexpected status 429 Too Many Requests: usage_limit_reached"),
+            "quota_limit"
+        );
+        assert_eq!(
+            agent_failure_category("unexpected status 429 Too Many Requests"),
+            "rate_limit"
+        );
+        assert_eq!(
+            agent_failure_category("unexpected status 401 Unauthorized"),
+            "authentication_or_access"
+        );
+        assert_eq!(agent_failure_category("synthetic failure"), "unclassified");
+    }
+
+    // V8：端到端核对——一个真实子进程按 Claude 的 stream-json 格式输出超限 result 事件
+    // 并以退出码 1 结束（与实测一致），后端必须报 AGENT_EXIT_FAILED，且
+    // error.details.agentFailureCategory = context_limit（重试脚本读的就是这个字段）。
+    #[cfg(unix)]
+    #[test]
+    fn claude_prompt_too_long_exit_reports_context_limit_category() {
+        let owner = std::env::temp_dir().join("llm-wiki-desktop");
+        ensure_private_directory(&owner).unwrap();
+        let lease = tempfile::Builder::new()
+            .prefix("claude-result-category-")
+            .tempdir_in(&owner)
+            .unwrap();
+        let stream = [
+            r#"{"type":"system","subtype":"init","cwd":"/tmp/synthetic","session_id":"synthetic-session","tools":[],"model":"claude-opus-5","permissionMode":"dontAsk","claude_code_version":"2.1.259"}"#,
+            REAL_CLAUDE_PROMPT_TOO_LONG_RESULT,
+        ]
+        .join("\n");
+        std::fs::write(lease.path().join("claude-stream.jsonl"), format!("{stream}\n")).unwrap();
+        let tasks = TaskService::default();
+        let task = tasks.create_task(
+            TaskType::WikiCompile,
+            Some("synthetic".into()),
+            "claude prompt too long".into(),
+            true,
+        );
+        // `sh -c 脚本 stream-json`：多出来的 stream-json 只是 $0，作用是让后端把这次调用
+        // 当成结构化输出（is_structured_invocation 看参数里有没有 stream-json）。
+        let error = run_streaming_process_with_events_and_limits(
+            &AgentInvocation {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "/bin/cat claude-stream.jsonl; exit 1".into(),
+                    "stream-json".into(),
+                ],
+                stdin: None,
+                cwd: lease.path().to_path_buf(),
+            },
+            &tasks,
+            &task.id,
+            &|_| {},
+            &|_| {},
+            false,
+            None,
+            MAX_AGENT_CAPTURE_BYTES,
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "AGENT_EXIT_FAILED");
+        let details = error.details.as_ref().expect("structured failure carries details");
+        assert_eq!(details["agentFailureCategory"], "context_limit");
+        assert_eq!(details["exitCode"], 1);
+        assert_eq!(details["structuredTerminalSeen"], true);
+        assert!(!format!("{error:?}").contains("1393966"));
     }
 
     #[test]
