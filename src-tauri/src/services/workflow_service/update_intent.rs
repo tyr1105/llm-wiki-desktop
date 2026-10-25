@@ -10,6 +10,13 @@ use crate::services::{CompileLegacyAdapter, FileStore, SettingsService};
 use crate::tasks::TaskService;
 use serde::Serialize;
 
+/// Agent 路线的配置版本号。入队时记下，执行前比对，不一致就报 WORKFLOW_ROUTE_CHANGED。
+///
+/// V8 从 v1 升到 v2：整理的上下文规则变了（规划按 token 预算走有界、log.md 不再进入
+/// 任何提示、Claude 也走有界规划），V7 时期排队的旧任务必须安全失败，不能在新规则下
+/// 悄悄执行。重试脚本每次重试都会生成新的请求 ID（新任务），不受影响。
+pub(crate) const CONFIGURED_AGENT_ROUTE_REVISION: &str = "configured-agent-v2";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateWikiOptions {
@@ -386,7 +393,7 @@ fn configured_route(
         WorkflowRouteSelection::Agent { agent } => Ok(WorkflowRoute::Agent {
             agent,
             model: None,
-            route_revision: "configured-agent-v1".into(),
+            route_revision: CONFIGURED_AGENT_ROUTE_REVISION.into(),
         }),
         WorkflowRouteSelection::Byok { provider } => {
             let config = configured

@@ -236,12 +236,12 @@ fn enqueue_request(root: &std::path::Path, request: UpdateWikiRequest) -> Enqueu
         route: Some(WorkflowRoute::Agent {
             agent: AgentKind::Codex,
             model: None,
-            route_revision: "configured-agent-v1".into(),
+            route_revision: CONFIGURED_AGENT_ROUTE_REVISION.into(),
         }),
         baseline_fingerprint: format!("update-intent:{}", request.request_id),
         execution_options: WorkflowExecutionOptions {
             preparation_revision: request.request_id.clone(),
-            update_config_revision: Some("configured-agent-v1".into()),
+            update_config_revision: Some(CONFIGURED_AGENT_ROUTE_REVISION.into()),
             update_request: Some(request),
             ..Default::default()
         },
@@ -631,6 +631,43 @@ fn changed_provider_configuration_rejects_binding_before_credentials_or_processe
     let unchanged = tasks.get_workflow_run(&run.task_id).unwrap();
     assert_eq!(unchanged.fingerprint, run.fingerprint);
     assert_eq!(unchanged.route, run.route);
+}
+
+// V8：Agent 路线版本升到 v2。V7 时期排队的任务（入队时记的是 configured-agent-v1）
+// 在绑定输入时必须以 WORKFLOW_ROUTE_CHANGED 安全失败，不能在新的上下文规则下悄悄执行，
+// 也不能去探测或启动 Agent。
+#[test]
+fn v7_queued_agent_task_fails_closed_after_route_revision_bump() {
+    assert_eq!(CONFIGURED_AGENT_ROUTE_REVISION, "configured-agent-v2");
+    let (root, context, _) = metadata_fixture();
+    let services = BindingServices::new(false);
+    let workflows = WorkflowService::default();
+    let tasks = TaskService::default();
+    let mut v7_request = enqueue_request(root.path(), intent());
+    v7_request.route = Some(WorkflowRoute::Agent {
+        agent: AgentKind::Codex,
+        model: None,
+        route_revision: "configured-agent-v1".into(),
+    });
+    v7_request.execution_options.update_config_revision = Some("configured-agent-v1".into());
+    let run = created_run(workflows.coordinator.enqueue(&tasks, v7_request).unwrap());
+    let error = workflows
+        .bind_update_wiki_inputs(&services.environment(&context), &tasks, &run)
+        .unwrap_err();
+    assert_eq!(error.code, "WORKFLOW_ROUTE_CHANGED");
+    let unchanged = tasks.get_workflow_run(&run.task_id).unwrap();
+    assert_eq!(unchanged.fingerprint, run.fingerprint);
+    assert_eq!(unchanged.route, run.route);
+    // 新入队的 Agent 任务记的是 v2。
+    assert!(matches!(
+        configured_route(
+            &context,
+            &services.settings,
+            Some(&WorkflowRouteSelection::Agent { agent: AgentKind::Claude })
+        )
+        .unwrap(),
+        WorkflowRoute::Agent { route_revision, .. } if route_revision == CONFIGURED_AGENT_ROUTE_REVISION
+    ));
 }
 
 #[test]

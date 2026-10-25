@@ -317,6 +317,8 @@ mod tests {
             &selected,
             &scope,
             CompileGenerationPolicy::WorkflowReviewableDeletes,
+            // V8 新增的任务日志回调；这个计划不含 wiki/log.md，不会写日志。
+            &mut |_| Ok(()),
         )
         .unwrap();
         assert_eq!(dependencies.len(), 1);

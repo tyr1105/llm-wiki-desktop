@@ -36,6 +36,9 @@ use source_context::SourceContext;
 mod agent_pages;
 #[path = "compile_service/agent_plan.rs"]
 mod agent_plan;
+// V8：按 Agent 计算上下文窗口、内联阈值和单次初始输入硬上限（token 按 UTF-8 字节 ÷ 2 估算）。
+#[path = "compile_service/agent_budget.rs"]
+mod agent_budget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileApplyOutcome {
@@ -111,6 +114,15 @@ struct WorkspaceSourceInput {
 
 const WORKSPACE_SOURCE_INPUTS: &str = ".compile-source-inputs.json";
 
+/// 把工作区 Markdown 拼进提示词时的用途。
+/// 规划（Planning）不需要日志正文，省略 wiki/log.md 的正文；
+/// 生成（Generation，即要整页产出 log.md 的旧清单/提示）必须看到全文，保持原样。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceMarkdownUse {
+    Planning,
+    Generation,
+}
+
 pub struct CompileExecutionServices<'a> {
     pub agent_service: &'a AgentService,
     pub llm_service: &'a LlmService,
@@ -163,7 +175,8 @@ impl CompileService {
         prompt.push('\n');
         prompt.push_str(&crate::utils::i18n::language_instruction(language));
         prompt.push_str(" Write each page's prose body in that language; keep frontmatter keys, paths, and this JSON structure in English.\n");
-        Self::append_workspace_markdown(&mut prompt, workspace)?;
+        // 这是要整页产出 wiki/log.md 的生成提示，必须看到日志全文，不能省略。
+        Self::append_workspace_markdown(&mut prompt, workspace, WorkspaceMarkdownUse::Generation)?;
         Ok(prompt)
     }
 
@@ -181,7 +194,8 @@ impl CompileService {
         policy: CompileGenerationPolicy,
     ) -> Result<String, BackendError> {
         let mut prompt = Self::plan_prompt_header(language, policy);
-        Self::append_workspace_markdown(&mut prompt, workspace)?;
+        // V8：规划提示（全量路径）不内嵌 wiki/log.md 的正文，只留路径和标注。
+        Self::append_workspace_markdown(&mut prompt, workspace, WorkspaceMarkdownUse::Planning)?;
         Ok(prompt)
     }
 
@@ -205,6 +219,10 @@ impl CompileService {
         } else {
             prompt.push_str("Every selected Source must appear in sourceIds of at least one derived plan item. If a Source cannot be integrated, stop and explain why; never omit it while reporting success.\n");
         }
+        // V8：真实计划几乎每份都把 wiki/log.md 列进 affectedExistingPages，导致 120 万字
+        // 的日志被整篇内嵌进页面提示。这里先在提示头里说明；后端在绑定计划前还会
+        // 静默剔除它（prepare_bound_plan），两道保险。
+        prompt.push_str("Never list wiki/log.md in affectedExistingPages: its history is retained unchanged and candidate generation appends a bounded log entry locally, so it is never planning or page context.\n");
         prompt
     }
 
@@ -243,7 +261,8 @@ impl CompileService {
             prompt.push_str(&plan_json);
         }
         prompt.push('\n');
-        Self::append_workspace_markdown(&mut prompt, workspace)?;
+        // 清单（manifest）提示要求整页产出 wiki/log.md，保留全文，避免在看不到日志的情况下改写它。
+        Self::append_workspace_markdown(&mut prompt, workspace, WorkspaceMarkdownUse::Generation)?;
         Ok(prompt)
     }
 
@@ -356,7 +375,15 @@ impl CompileService {
                     )
                     .map_err(task_operation_error)?;
                 // All Agent routes bind a plan before requesting candidate bodies.
-                let plan_prompt = agent_plan::prompt(*agent, workspace, &language, policy)?;
+                // V8：规划提示按该 Agent 的 token 预算决定全量内联还是有界；超过硬上限在
+                // 这里就报 COMPILE_AGENT_INPUT_TOO_LARGE，不会启动命令行。
+                let planning = agent_plan::prompt(*agent, workspace, &language, policy)?;
+                // 记一行"走了哪条路、估算多少 token、预算多少"，便于试跑时核对（只有计数）。
+                services
+                    .task_service
+                    .append_log(task_id, LogLevel::Info, planning.log_line())
+                    .map_err(task_operation_error)?;
+                let plan_prompt = planning.text;
                 let invocation = AgentService::chat_invocation(*agent, workspace, &plan_prompt)?;
                 let raw_plan = services.agent_service.run_task_streaming_for_agent(
                     *agent,
@@ -373,6 +400,12 @@ impl CompileService {
                     sources,
                     &source_context,
                     policy,
+                    &mut |message| {
+                        services
+                            .task_service
+                            .append_log(task_id, LogLevel::Info, message)
+                            .map_err(task_operation_error)
+                    },
                 )?;
                 observer.begin_candidate_generation()?;
                 let manifest = if plan.items.is_empty() {
@@ -532,6 +565,12 @@ impl CompileService {
                     sources,
                     &source_context,
                     policy,
+                    &mut |message| {
+                        services
+                            .task_service
+                            .append_log(task_id, LogLevel::Info, message)
+                            .map_err(task_operation_error)
+                    },
                 ) {
                     Ok(dependencies) => dependencies,
                     Err(error) => {
@@ -642,6 +681,7 @@ impl CompileService {
     fn append_workspace_markdown(
         prompt: &mut String,
         workspace: &Path,
+        usage: WorkspaceMarkdownUse,
     ) -> Result<(), BackendError> {
         for name in ["purpose.md", "schema.md"] {
             let content = std::fs::read_to_string(workspace.join(name)).map_err(|error| {
@@ -691,6 +731,16 @@ impl CompileService {
                 let content = std::fs::read_to_string(&file).map_err(|error| {
                     BackendError::new("COMPILE_INPUT_READ_FAILED", error.to_string(), true, false)
                 })?;
+                // V8：规划只需要知道日志存在；正文（120 万字、每批还在涨）不进提示，
+                // 只留路径、大小和哈希，并标注 retained_history_local_append_only。
+                if usage == WorkspaceMarkdownUse::Planning && is_historical_log_path(&relative) {
+                    prompt.push_str(&format!(
+                        "\n--- {relative} ---\n[Body omitted from planning (planningUse: retained_history_local_append_only): {} UTF-8 bytes, SHA-256 {}. The complete history is retained unchanged and candidate generation appends a bounded entry locally. Never list this file in affectedExistingPages.]\n",
+                        content.len(),
+                        hash_bytes(content.as_bytes()),
+                    ));
+                    continue;
+                }
                 prompt.push_str(&format!("\n--- {relative} ---\n{content}"));
         }
         Ok(())
@@ -2669,6 +2719,7 @@ fn empty_manifest(plan: &CompilePlan) -> CompileManifest {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_bound_plan(
     context: &ProjectContext,
     workspace: &Path,
@@ -2677,9 +2728,19 @@ fn prepare_bound_plan(
     selected: &[ResolvedCompileSource],
     source_context: &SourceContext,
     policy: CompileGenerationPolicy,
+    // 写任务日志的回调（生产里写进 TaskService 的任务日志，测试里收集起来断言）。
+    log: &mut dyn FnMut(String) -> Result<(), BackendError>,
 ) -> Result<Vec<crate::models::compile::CompileSourceDependency>, BackendError> {
     if policy == CompileGenerationPolicy::LegacyNoDeletes && !plan.source_decisions.is_empty() {
         return Err(BackendError::new("COMPILE_SOURCE_COVERAGE_INCOMPLETE", "This compile route requires every selected Source to be integrated into a derived page.", true, true));
+    }
+    // V8：必须在 bind_plan 和 ensure_plan_target_context 之前剔除，
+    // 否则 log.md 会被当成相关页复制进工作区并内嵌进页面提示。
+    let removed = strip_historical_log_from_affected_pages(plan);
+    if removed > 0 {
+        log(format!(
+            "Removed {removed} wiki/log.md reference(s) from plan affectedExistingPages: the history is retained and appended locally, never embedded as page context."
+        ))?;
     }
     let dependencies = source_context.bind_plan(context, workspace, plan, baseline)?;
     let known = source_context::validate_bound_sources(context, selected, &dependencies)?;
@@ -3418,6 +3479,30 @@ fn is_compile_protected_path(raw: &str) -> bool {
 
 fn is_structural_page(raw: &str) -> bool {
     matches!(raw, "wiki/index.md" | "wiki/overview.md" | "wiki/log.md")
+}
+
+/// 是否是历史日志 wiki/log.md。统一反斜杠并忽略 ASCII 大小写：macOS 默认文件系统
+/// 不区分大小写，模型写成 "wiki/Log.md" 时实际指向同一个文件，同样不能内嵌。
+fn is_historical_log_path(raw: &str) -> bool {
+    raw.trim().replace('\\', "/").eq_ignore_ascii_case("wiki/log.md")
+}
+
+/// V8：在绑定计划之前，静默把每个计划项 affectedExistingPages 里的 wiki/log.md 剔除。
+///
+/// 为什么不在 validate_plan 里报错：只读统计 14 份真实计划，每一份都含它（71 个计划项
+/// 里出现 34 次），直接拒绝会让几乎所有规划报 COMPILE_PLAN_INVALID。
+/// 为什么必须剔除：affectedExistingPages 会被复制进工作区并整篇内嵌进页面提示，
+/// 120 万字的日志会把单页输入直接撑爆；日志本身由后端本地追加，从不需要作为上下文。
+/// 返回被剔除的条目数，供调用方写任务日志。
+fn strip_historical_log_from_affected_pages(plan: &mut CompilePlan) -> usize {
+    let mut removed = 0;
+    for item in &mut plan.items {
+        let before = item.affected_existing_pages.len();
+        item.affected_existing_pages
+            .retain(|path| !is_historical_log_path(path));
+        removed += before - item.affected_existing_pages.len();
+    }
+    removed
 }
 
 fn is_known_page_type(raw: &str) -> bool {
@@ -5465,5 +5550,117 @@ mod tests {
         CompileService::validate_plan(&context, &plan, &["wiki/concepts/topic.md".into()], &known)
             .unwrap();
         validate_selected_source_coverage(&plan, &[source], &known).unwrap();
+    }
+
+    // V8：真实计划几乎都把 wiki/log.md 列进 affectedExistingPages。绑定前要静默剔除
+    // （含大小写变体）并记一条任务日志，不能报 COMPILE_PLAN_INVALID，也不能把日志
+    // 复制进工作区当页面上下文。
+    #[test]
+    fn bound_plan_silently_drops_historical_log_from_affected_pages() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("wiki/concepts")).unwrap();
+        fs::create_dir_all(root.path().join("wiki/sources")).unwrap();
+        fs::write(root.path().join("wiki/sources/旧.md"), "# old evidence\n").unwrap();
+        fs::write(
+            root.path().join("wiki/concepts/topic.md"),
+            "---\ntype: concept\nsources: [旧.md]\n---\n# prior knowledge\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("wiki/log.md"), "# Log\nHISTORICAL_LOG_BODY\n").unwrap();
+        let context = ProjectContext::new("historical-log", root.path().to_path_buf());
+        let source = ResolvedCompileSource {
+            reference: SourceVersionRef {
+                source_id: "new".into(),
+                version_id: "v1".into(),
+                content_hash: "new-hash".into(),
+            },
+            project_path: "wiki/sources/新.md".into(),
+            workspace_path: "wiki/sources/新.md".into(),
+            absolute_path: root.path().join("wiki/sources/新.md"),
+            already_consumed: false,
+            registry: CompileSourceRegistry::V2,
+        };
+        let mut plan = CompilePlan {
+            summary: "merge".into(),
+            items: vec![CompilePlanItem {
+                action: CompileAction::Merge,
+                target_path: "wiki/concepts/topic.md".into(),
+                page_type: CompilePageType::Concept,
+                source_ids: vec!["旧.md".into(), "新.md".into()],
+                affected_existing_pages: vec![
+                    "wiki/log.md".into(),
+                    "wiki/concepts/topic.md".into(),
+                    "Wiki/Log.md".into(),
+                ],
+                reason: "combine prior and new evidence".into(),
+                risk_flags: vec![],
+            }],
+            global_risk_flags: vec![],
+            source_decisions: Vec::new(),
+        };
+        fs::create_dir_all(root.path().join(".app")).unwrap();
+        fs::write(
+            root.path().join(".app/source-index.json"),
+            r#"{"sources":{}}"#,
+        )
+        .unwrap();
+        let scope = SourceContext::new(&context, root.path(), &[source.clone()]).unwrap();
+        let baseline = CompileService::snapshot_wiki(&context).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut logs = Vec::new();
+        prepare_bound_plan(
+            &context,
+            workspace.path(),
+            &mut plan,
+            &baseline,
+            &[source],
+            &scope,
+            CompileGenerationPolicy::WorkflowReviewableDeletes,
+            &mut |message| {
+                logs.push(message);
+                Ok(())
+            },
+        )
+        .expect("a plan that lists wiki/log.md must still bind");
+        assert_eq!(
+            plan.items[0].affected_existing_pages,
+            vec!["wiki/concepts/topic.md".to_string()]
+        );
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("Removed 2 wiki/log.md reference(s)"));
+        assert!(workspace.path().join("wiki/concepts/topic.md").is_file());
+        assert!(
+            !workspace.path().join("wiki/log.md").exists(),
+            "the historical log must not be copied in as page context"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("wiki/log.md")).unwrap(),
+            "# Log\nHISTORICAL_LOG_BODY\n"
+        );
+        // 没有 log.md 的计划不记日志。
+        let mut clean = plan.clone();
+        assert_eq!(strip_historical_log_from_affected_pages(&mut clean), 0);
+    }
+
+    // V8：规划提示（全量路径）不含 log.md 正文；要整页产出 log.md 的生成提示保持全文。
+    #[test]
+    fn planning_prompt_omits_log_body_but_generation_prompts_keep_it() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("wiki")).unwrap();
+        fs::write(root.path().join("purpose.md"), "# Purpose").unwrap();
+        fs::write(root.path().join("schema.md"), "# Schema").unwrap();
+        fs::write(root.path().join("wiki/log.md"), "# Log\nHISTORICAL_LOG_BODY\n").unwrap();
+        fs::write(root.path().join("wiki/index.md"), "# Index\nINDEX_BODY\n").unwrap();
+        let plan = CompileService::provider_plan_prompt(root.path(), "en").unwrap();
+        assert!(!plan.contains("HISTORICAL_LOG_BODY"));
+        assert!(plan.contains("--- wiki/log.md ---"));
+        assert!(plan.contains("retained_history_local_append_only"));
+        assert!(plan.contains(&hash_bytes(b"# Log\nHISTORICAL_LOG_BODY\n")));
+        assert!(plan.contains("INDEX_BODY"), "other pages stay inline on the full path");
+        assert!(plan.contains("Never list wiki/log.md in affectedExistingPages"));
+        let manifest = CompileService::provider_manifest_prompt(root.path(), "en", None).unwrap();
+        assert!(manifest.contains("HISTORICAL_LOG_BODY"));
+        let legacy = CompileService::provider_prompt(root.path(), "en").unwrap();
+        assert!(legacy.contains("HISTORICAL_LOG_BODY"));
     }
 }
