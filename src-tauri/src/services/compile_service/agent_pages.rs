@@ -12,8 +12,102 @@
 //!   4. 发出前最终提示仍超过硬上限，就在启动命令行之前报 COMPILE_AGENT_INPUT_TOO_LARGE。
 //! 文件模式（2、3）只对具备只读文件工具的 Agent（Claude、Codex）开放；调用方根据
 //! `PageCall::transport` 选择只读整理调用或不开工具的调用。
+//!
+//! V8 改动集 C（日志止涨 + 结构页增长闸门）：
+//!   * wiki/log.md 不再追加约 1 万字符的审计 JSON。完整审计 JSON（结构与 V7 写进 log
+//!     的完全相同）作为候选的一部分（`CompileCandidate::audit_record`）随候选进入审阅，
+//!     应用成功时与 CompileRecord 同一个文件事务写到 `.app/.../compile-audit/<任务编号>.json`；
+//!     log.md 只追加标题 + 3 行人能读的摘要（时间、任务编号、所选来源路径、受影响页面、
+//!     审计文件路径）。
+//!   * index.md / overview.md 的候选相对原文增长超过上限（默认每批 4000 字符）就拒绝，
+//!     报 COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED，绝不静默截断；提示词也改成
+//!     "就地更新导航、不追加逐批叙述、不删任何已有 raw/sources/... 引用"。
 use super::*;
 use super::agent_budget::{self, AgentInputBudget, OversizeReason};
+
+/// 结构页（index.md、overview.md）每批允许增长的默认上限（Unicode 字符数）。
+///
+/// 为什么是 4000：最近 33 批实测平均每批 index +1,681、overview +1,395 字符，正常的
+/// "新增几页导航、改几句现状"远低于 4000；而 V7 时期每批追加整段"本轮/历史阶段"叙述
+/// 的做法会超过它。这是硬闸门：超过就拒绝候选，不截断。
+pub(super) const DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS: usize = 4_000;
+
+/// 覆盖结构页增长上限的环境变量（正整数，单位：字符），由启动后端的脚本传给后端
+/// 进程本身。例如某一批确实需要大幅改写导航时，运维可以临时调大，不必重新编译。
+pub(super) const STRUCTURAL_PAGE_GROWTH_ENV: &str = "LLM_WIKI_STRUCTURAL_PAGE_GROWTH_CHARS";
+
+/// 环境变量允许的范围；超出范围视为写错，忽略并回退默认值（防止误写成 0 让每批都失败，
+/// 或多写几个 0 等于关掉闸门）。
+const MIN_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS: usize = 500;
+const MAX_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS: usize = 200_000;
+
+/// 完整审计文件的大小上限。它不再进入 wiki/log.md，也不会进任何提示词，所以比 V7
+/// 给日志条目的 80KB 宽松；仍然设上限，防止异常大的依赖清单无界写盘。
+/// 生成时和应用前（`CompileService::validate_candidate_audit`）用同一个上限。
+pub(super) const MAX_CANDIDATE_AUDIT_BYTES: usize = 256 * 1024;
+
+/// log.md 摘要里"受影响页面"清单最多占用的字节数；超出部分只写数量，完整清单在审计文件里。
+/// （所选来源路径不受这个限制，一条都不省略，见 `candidate_log_summary`。）
+const LOG_SUMMARY_PAGE_LIST_BYTES: usize = 900;
+
+/// 审计文件的 kind 字段，应用时据此确认这份内容确实是候选审计记录。
+pub(super) const CANDIDATE_AUDIT_KIND: &str = "update_wiki_candidate_audit";
+
+/// V8：本批候选审计记录的落点和元数据，由调用方（generate_candidate）给出。
+#[derive(Debug, Clone)]
+pub(super) struct CandidateAuditTarget {
+    /// 整理任务编号：就是 Update Wiki 工作流的 task_id，也是 CompileRecord 的 compileTaskId。
+    pub(super) compile_task_id: String,
+    /// 候选生成时间（RFC 3339，UTC，精确到秒），写进日志摘要和审计文件。
+    pub(super) generated_at: String,
+    /// 审计文件在项目里的相对路径（已按项目布局映射）。
+    pub(super) audit_path: String,
+}
+
+/// V8：逐页生成里和"候选审计记录""结构页增长闸门"有关的设置。
+#[derive(Debug, Clone)]
+pub(super) struct CandidateGenerationOptions {
+    pub(super) audit: CandidateAuditTarget,
+    /// index.md / overview.md 每批最多允许增长多少字符（Unicode 标量个数）。
+    pub(super) structural_growth_limit_chars: usize,
+}
+
+impl CandidateGenerationOptions {
+    /// 测试入口用的固定设置：固定任务编号和时间（保证串行/并行两次生成逐字节相同），
+    /// 增长上限用默认常量（不读环境变量，测试结果稳定）。
+    fn for_tests() -> Self {
+        Self {
+            audit: CandidateAuditTarget {
+                compile_task_id: "test-compile-task".into(),
+                generated_at: "2026-01-01T00:00:00Z".into(),
+                audit_path: ".app/compile-audit/test-compile-task.json".into(),
+            },
+            structural_growth_limit_chars: DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS,
+        }
+    }
+}
+
+/// 读取结构页增长上限：环境变量是合法范围内的正整数就用它，否则用默认值。
+pub(super) fn structural_growth_limit_from_env() -> usize {
+    parse_structural_growth_limit(std::env::var(STRUCTURAL_PAGE_GROWTH_ENV).ok().as_deref())
+}
+
+/// 解析环境变量的值（拆出来方便测试）：空、非数字或超出范围都回退默认值。
+fn parse_structural_growth_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| {
+            (MIN_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS..=MAX_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS)
+                .contains(value)
+        })
+        .unwrap_or(DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS)
+}
+
+/// V8：逐页生成的结果——候选清单，加上 log.md 摘要所指向的完整审计记录。
+#[derive(Debug)]
+pub(super) struct GeneratedPages {
+    pub(super) manifest: CompileManifest,
+    pub(super) audit: CompileCandidateAudit,
+}
 
 /// 一页上下文的交付方式，交给调用方选择调用配置、写任务日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +167,7 @@ pub(super) fn generate(
         // 这里只影响请求里附带的文件模式（被忽略），用固定的 Codex 默认预算，
         // 不读环境变量，保证测试结果稳定。
         &AgentInputBudget::for_agent_with_overrides(AgentKind::Codex, None),
+        &CandidateGenerationOptions::for_tests(),
         workspace,
         language,
         plan,
@@ -87,6 +182,7 @@ pub(super) fn generate(
         },
         progress,
     )
+    .map(|generated| generated.manifest)
 }
 
 // Only adjacent index/overview requests may overlap. Explicit self/baseline
@@ -115,9 +211,12 @@ pub(super) fn generate_with_parallel_scaffolds(
 }
 
 /// 生产入口：按该 Agent 的预算（含环境变量 LLM_WIKI_AGENT_CONTEXT_TOKENS 的覆盖）逐页生成。
+/// V8 改动集 C：同时带上审计记录的落点（任务编号、时间、路径）和结构页增长上限，
+/// 返回候选清单和完整审计记录。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generate_with_parallel_scaffolds_for_agent(
     agent: AgentKind,
+    options: &CandidateGenerationOptions,
     workspace: &Path,
     language: &str,
     plan: &CompilePlan,
@@ -125,9 +224,10 @@ pub(super) fn generate_with_parallel_scaffolds_for_agent(
     dependencies: &[crate::models::compile::CompileSourceDependency],
     complete: impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError> + Sync,
     progress: impl FnMut(usize, usize, &str) -> Result<(), BackendError>,
-) -> Result<CompileManifest, BackendError> {
-    generate_with_parallel_scaffolds_with_budget(
+) -> Result<GeneratedPages, BackendError> {
+    generate_pages_with_options(
         AgentInputBudget::for_agent(agent),
+        options,
         workspace,
         language,
         plan,
@@ -139,6 +239,7 @@ pub(super) fn generate_with_parallel_scaffolds_for_agent(
 }
 
 /// 按给定预算逐页生成。拆出来是为了测试能注入不同 Agent/窗口验证交付方式的切换。
+/// 测试入口：审计落点和增长上限用固定的测试设置，只返回候选清单。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generate_with_parallel_scaffolds_with_budget(
     budget: AgentInputBudget,
@@ -150,6 +251,33 @@ pub(super) fn generate_with_parallel_scaffolds_with_budget(
     complete: impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError> + Sync,
     progress: impl FnMut(usize, usize, &str) -> Result<(), BackendError>,
 ) -> Result<CompileManifest, BackendError> {
+    generate_pages_with_options(
+        budget,
+        &CandidateGenerationOptions::for_tests(),
+        workspace,
+        language,
+        plan,
+        sources,
+        dependencies,
+        complete,
+        progress,
+    )
+    .map(|generated| generated.manifest)
+}
+
+/// 逐页生成的核心：预算、审计落点和结构页增长上限都由调用方给出。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn generate_pages_with_options(
+    budget: AgentInputBudget,
+    options: &CandidateGenerationOptions,
+    workspace: &Path,
+    language: &str,
+    plan: &CompilePlan,
+    sources: &[ResolvedCompileSource],
+    dependencies: &[crate::models::compile::CompileSourceDependency],
+    complete: impl Fn(&Path, &str, Option<&str>, PageCall<'_>) -> Result<String, BackendError> + Sync,
+    progress: impl FnMut(usize, usize, &str) -> Result<(), BackendError>,
+) -> Result<GeneratedPages, BackendError> {
     let parallel_scaffolds = !plan.items.iter().any(|item| {
         is_structural_page(&item.target_path)
             && item.affected_existing_pages.iter()
@@ -158,6 +286,7 @@ pub(super) fn generate_with_parallel_scaffolds_with_budget(
     let budget = &budget;
     generate_with_executor(
         budget,
+        options,
         workspace,
         language,
         plan,
@@ -364,6 +493,7 @@ fn fits_hard_limit(budget: &AgentInputBudget, text: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn page_request(
     budget: &AgentInputBudget,
+    structural_growth_limit_chars: usize,
     workspace: &Path,
     language: &str,
     plan: &CompilePlan,
@@ -376,6 +506,7 @@ fn page_request(
     let build = |mode: PageContextMode| {
         page_prompt_parts(
             workspace, language, plan, target, sources, dependencies, generated, deletions, mode,
+            structural_growth_limit_chars,
         )
     };
     // 完整内联提示（与 V7 逐字节相同）。
@@ -428,6 +559,7 @@ fn page_request(
 #[allow(clippy::too_many_arguments)]
 fn generate_with_executor(
     budget: &AgentInputBudget,
+    options: &CandidateGenerationOptions,
     workspace: &Path,
     language: &str,
     plan: &CompilePlan,
@@ -436,7 +568,7 @@ fn generate_with_executor(
     parallel_scaffolds: bool,
     mut complete: impl FnMut(&[PageRequest]) -> Result<Vec<String>, BackendError>,
     mut progress: impl FnMut(usize, usize, &str) -> Result<(), BackendError>,
-) -> Result<CompileManifest, BackendError> {
+) -> Result<GeneratedPages, BackendError> {
     let mut targets = plan
         .items
         .iter()
@@ -451,12 +583,14 @@ fn generate_with_executor(
     }
     let mut files = Vec::new();
     let mut deletions = std::collections::BTreeSet::new();
+    // V8：log.md 由后端本地追加时同时产出完整审计记录（targets 去重后 log.md 恰好一次）。
+    let mut audit = None;
     let mut index = 0;
     while index < targets.len() {
         let target = &targets[index];
         if target == "wiki/log.md" {
             progress(index + 1, targets.len(), target)?;
-            files.push(append_candidate_log(
+            let (log, record) = append_candidate_log(
                 workspace,
                 language,
                 plan,
@@ -464,7 +598,10 @@ fn generate_with_executor(
                 dependencies,
                 &files,
                 &deletions,
-            )?);
+                &options.audit,
+            )?;
+            files.push(log);
+            audit = Some(record);
             index += 1;
             continue;
         }
@@ -484,7 +621,8 @@ fn generate_with_executor(
                 // V8：按该 Agent 的预算决定内联、分层还是整体文件模式
                 // （V7 这里不管实际用哪个 Agent，都按 Codex 的字符上限判断）。
                 page_request(
-                    budget, workspace, language, plan, target, sources, dependencies, &files, &deletions,
+                    budget, options.structural_growth_limit_chars, workspace, language, plan, target,
+                    sources, dependencies, &files, &deletions,
                 )
             })
             .collect::<Result<Vec<_>, BackendError>>()?;
@@ -519,6 +657,15 @@ fn generate_with_executor(
             {
                 return Err(invalid("A scaffold response cannot introduce new deletions after navigation generation begins."));
             }
+            // V8 硬闸门：index.md / overview.md 的候选相对原文增长超过上限就拒绝整份候选
+            // （不截断、不改写模型输出）。在这里检查而不是等全部页面生成完：越早失败，
+            // 越少浪费后续的 Agent 调用。
+            check_structural_page_growth(
+                workspace,
+                target,
+                &fragment.files[0].content,
+                options.structural_growth_limit_chars,
+            )?;
             deletions.extend(fragment.deletions);
             files.extend(fragment.files);
         }
@@ -530,40 +677,98 @@ fn generate_with_executor(
         summary: plan.summary.clone(),
     };
     CompileService::validate_workflow_manifest(&manifest)?;
-    Ok(manifest)
+    // log.md 总在 targets 里（上面强制加入），所以这里一定有审计记录；万一没有也绝不
+    // 悄悄产出一份不带审计的候选。
+    let audit = audit.ok_or_else(|| {
+        invalid("The candidate log entry and its audit record were not generated.")
+    })?;
+    Ok(GeneratedPages { manifest, audit })
+}
+
+/// V8 结构页增长硬闸门。
+///
+/// 做什么：只对 wiki/index.md、wiki/overview.md 生效。增长量 = 候选字符数 − 原文字符数
+/// （原文就是候选工作区里的这一页，也就是 PageEdits 所对的基线；页面不存在时按 0 算）。
+/// 增长量超过上限就返回 COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED，details 写明增长量
+/// 和上限（只有计数，不含正文）。缩短、持平都放行。
+///
+/// 为什么要硬闸门：实际生效的 schema 早就写着"index/overview 只做必要导航调整"，
+/// 同期 index 仍从 439 字涨到 18.6 万字——只靠提示词约束已被证明无效。
+fn check_structural_page_growth(
+    workspace: &Path,
+    target: &str,
+    candidate: &str,
+    limit_chars: usize,
+) -> Result<(), BackendError> {
+    if !matches!(target, "wiki/index.md" | "wiki/overview.md") {
+        return Ok(());
+    }
+    let baseline_chars = read_markdown(workspace, target, false)?
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    let candidate_chars = candidate.chars().count();
+    let growth_chars = candidate_chars.saturating_sub(baseline_chars);
+    if growth_chars <= limit_chars {
+        return Ok(());
+    }
+    Err(BackendError::new(
+        "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED",
+        format!(
+            "The `{target}` candidate grows by {growth_chars} characters, above the per-batch limit of {limit_chars}. Navigation pages must be updated in place without appending per-batch narrative; the candidate was rejected, not truncated."
+        ),
+        true,
+        true,
+    )
+    .with_details(serde_json::json!({
+        "path": target,
+        "baselineCharacters": baseline_chars,
+        "candidateCharacters": candidate_chars,
+        "growthCharacters": growth_chars,
+        "limitCharacters": limit_chars,
+        "unit": "unicode_scalar_values",
+        "limitEnv": STRUCTURAL_PAGE_GROWTH_ENV,
+    })))
 }
 
 fn invalid(message: &str) -> BackendError {
     BackendError::new("COMPILE_OUTPUT_INVALID", message, true, true)
 }
 
-// History is immutable context, not another model output. The appended record is
-// still only a candidate and passes the same diff, baseline and consumption gates.
-fn append_candidate_log(
-    workspace: &Path,
-    language: &str,
+/// 一条所选来源在审计记录里的计划状态（与 V7 写进 log 的 plannedStatus 取值相同）。
+fn planned_source_status(
+    plan: &CompilePlan,
+    source: &ResolvedCompileSource,
+    known: &HashSet<String>,
+) -> (&'static str, Option<String>) {
+    let decision = plan.source_decisions.iter().find(|decision| {
+        canonical_source_ref(&decision.source_id, known).as_deref()
+            == Some(source.workspace_path.as_str())
+    });
+    let status = decision.map(|decision| match decision.status {
+        crate::models::compile::CompileSourceOutcomeStatus::Integrated => "planned_integration",
+        crate::models::compile::CompileSourceOutcomeStatus::AlreadyCovered => "already_covered_pending_validation",
+        crate::models::compile::CompileSourceOutcomeStatus::Deferred => "deferred",
+    }).unwrap_or("planned_integration_pending_validation");
+    (status, decision.map(|decision| bounded_log_text(&decision.reason)))
+}
+
+/// 完整审计记录本体：字段和取值与 V7 整段写进 wiki/log.md 的 JSON 完全相同
+/// （stage、summary、generatedPaths、selectedScope、readOnlyDependencies、proposedDeletions），
+/// 只是不再写进 log.md，而是放进审计文件的 `record` 字段。
+fn candidate_audit_record(
     plan: &CompilePlan,
     sources: &[ResolvedCompileSource],
     dependencies: &[crate::models::compile::CompileSourceDependency],
     generated: &[CompileFile],
     deletions: &std::collections::BTreeSet<String>,
-) -> Result<CompileFile, BackendError> {
-    let mut content = read_markdown(workspace, "wiki/log.md", false)?.unwrap_or_default();
+) -> serde_json::Value {
     let known = CompileService::known_source_refs_for_sources(sources);
     let selected = sources.iter().map(|source| {
-        let decision = plan.source_decisions.iter().find(|decision| {
-            canonical_source_ref(&decision.source_id, &known).as_deref()
-                == Some(source.workspace_path.as_str())
-        });
-        let status = decision.map(|decision| match decision.status {
-            crate::models::compile::CompileSourceOutcomeStatus::Integrated => "planned_integration",
-            crate::models::compile::CompileSourceOutcomeStatus::AlreadyCovered => "already_covered_pending_validation",
-            crate::models::compile::CompileSourceOutcomeStatus::Deferred => "deferred",
-        }).unwrap_or("planned_integration_pending_validation");
+        let (status, reason) = planned_source_status(plan, source, &known);
         serde_json::json!({"path": source.project_path, "sourceVersion": source.reference,
-            "plannedStatus": status, "reason": decision.map(|decision| bounded_log_text(&decision.reason))})
+            "plannedStatus": status, "reason": reason})
     }).collect::<Vec<_>>();
-    let record = serde_json::json!({
+    serde_json::json!({
         "stage": "candidate_only_not_consumption",
         "summary": bounded_log_text(&plan.summary),
         "generatedPaths": generated.iter().map(|file| file.path.as_str()).chain(std::iter::once("wiki/log.md")).collect::<Vec<_>>(),
@@ -572,23 +777,157 @@ fn append_candidate_log(
             "path": dependency.project_path, "sourceVersion": dependency.source_version
         })).collect::<Vec<_>>(),
         "proposedDeletions": deletions,
-    });
-    let explanation = if language.starts_with("zh") {
+    })
+}
+
+/// 与 V7 相同的说明文字：现在写在审计文件里，和记录本体放在一起。
+fn candidate_audit_explanation(language: &str) -> &'static str {
+    if language.starts_with("zh") {
         "候选生成记录，不代表应用、编译成功或来源消费（not consumption）。选中范围依计划分别记录；deferred 为暂缓、未消费。历史依赖仅供引用（read-only），不作为新增消费。最终状态以原生 CompileRecord 和提交回执为准；本记录不授予媒体清理许可。"
     } else {
         "Candidate generation does not imply application, compilation success or Source consumption (not consumption). Selected Sources retain their planned outcomes; deferred Sources remain unconsumed. Historical dependencies are read-only citations, not newly consumed Sources. Native CompileRecord and commit receipts determine final status; this record does not authorize media cleanup."
-    };
-    let entry = format!(
-        "\n\n### Update Wiki candidate record\n\n{explanation}\n\n```json\n{}\n```\n",
-        serde_json::to_string_pretty(&record).map_err(|error| invalid(&error.to_string()))?
-    );
-    if entry.len() > 80 * 1024 {
+    }
+}
+
+/// 摘要里引用一个路径：一般写成行内代码；路径里本身有反引号就原样写（不改路径，
+/// 保证 raw/sources/... 引用逐字可被检索到）。
+fn log_code_span(path: &str) -> String {
+    if path.contains('`') {
+        path.to_string()
+    } else {
+        format!("`{path}`")
+    }
+}
+
+/// V8：wiki/log.md 里追加的人能读的摘要。
+///
+/// 格式：保留 V7 的标题行 `### Update Wiki candidate record`（瘦身脚本和集成测试按它
+/// 计数），下面恰好 3 行：
+///   1. 时间 · 任务编号 · 本批来源数和计划状态 · 每条所选来源的路径（raw/sources/...）；
+///   2. 受影响页面数和清单（超出字节预算的只写数量）· 拟删除页数；
+///   3. 旧来源依赖条数 · 完整审计文件路径 · 一句"不代表应用或消费"的说明。
+///
+/// 为什么所选来源路径一条都不省：重试脚本的轻量审阅要求每个改动文件"旧来源引用只增
+/// 不减"、新增引用必须属于本组来源；摘要只追加本组来源的路径，两条都满足，人看日志
+/// 也能直接知道这一批整理了哪些来源。旧来源依赖（每批几十条）只记条数，清单在审计文件里。
+#[allow(clippy::too_many_arguments)]
+fn candidate_log_summary(
+    language: &str,
+    target: &CandidateAuditTarget,
+    plan: &CompilePlan,
+    sources: &[ResolvedCompileSource],
+    dependency_count: usize,
+    generated_paths: &[&str],
+    deletion_count: usize,
+) -> String {
+    let zh = language.starts_with("zh");
+    let known = CompileService::known_source_refs_for_sources(sources);
+    let (mut integrated, mut covered, mut deferred) = (0, 0, 0);
+    for source in sources {
+        match planned_source_status(plan, source, &known).0 {
+            "already_covered_pending_validation" => covered += 1,
+            "deferred" => deferred += 1,
+            _ => integrated += 1,
+        }
+    }
+    let separator = if zh { "、" } else { ", " };
+    let source_list = sources
+        .iter()
+        .map(|source| log_code_span(&source.project_path))
+        .collect::<Vec<_>>()
+        .join(separator);
+    // 受影响页面清单按字节预算截断，超出部分只写数量（完整清单在审计记录的 generatedPaths）。
+    let mut page_list = String::new();
+    let mut listed = 0;
+    for path in generated_paths {
+        let item = log_code_span(path);
+        let extra = if listed == 0 { item.len() } else { separator.len() + item.len() };
+        if page_list.len() + extra > LOG_SUMMARY_PAGE_LIST_BYTES {
+            break;
+        }
+        if listed > 0 {
+            page_list.push_str(separator);
+        }
+        page_list.push_str(&item);
+        listed += 1;
+    }
+    let omitted = generated_paths.len() - listed;
+    if omitted > 0 {
+        page_list.push_str(&if zh {
+            format!("…（另 {omitted} 个见审计记录）")
+        } else {
+            format!(" … (+{omitted} more in the audit record)")
+        });
+    }
+    let audit = log_code_span(&target.audit_path);
+    let (time, task) = (&target.generated_at, log_code_span(&target.compile_task_id));
+    let (source_count, page_count) = (sources.len(), generated_paths.len());
+    if zh {
+        format!(
+            "\n\n### Update Wiki candidate record\n\n- {time} · 任务 {task} · 本批来源 {source_count} 条（计划整合 {integrated}、已覆盖待核 {covered}、暂缓 {deferred}）：{source_list}\n- 受影响页面 {page_count} 个：{page_list}；拟删除页面 {deletion_count} 个\n- 完整审计记录（含旧来源依赖 {dependency_count} 条）：{audit}。候选生成记录，不代表应用、编译成功或来源消费（not consumption）；最终状态以原生 CompileRecord 为准。\n"
+        )
+    } else {
+        format!(
+            "\n\n### Update Wiki candidate record\n\n- {time} · task {task} · {source_count} selected Sources (planned integration {integrated}, already covered pending validation {covered}, deferred {deferred}): {source_list}\n- {page_count} affected pages: {page_list}; {deletion_count} proposed deletions\n- Full audit record (including {dependency_count} read-only historical dependencies): {audit}. Candidate generation does not imply application, compilation success or Source consumption (not consumption); native CompileRecord determines final status.\n"
+        )
+    }
+}
+
+// History is immutable context, not another model output. The appended record is
+// still only a candidate and passes the same diff, baseline and consumption gates.
+//
+// V8 改动集 C：完整审计 JSON 不再追加进 log.md（每批约 1 万字符，其中约 79% 是旧来源
+// 依赖清单），而是作为候选的一部分返回，应用成功时才写到审计文件；log.md 只追加
+// `candidate_log_summary` 的标题 + 3 行摘要。返回 (log.md 候选, 完整审计记录)。
+#[allow(clippy::too_many_arguments)]
+fn append_candidate_log(
+    workspace: &Path,
+    language: &str,
+    plan: &CompilePlan,
+    sources: &[ResolvedCompileSource],
+    dependencies: &[crate::models::compile::CompileSourceDependency],
+    generated: &[CompileFile],
+    deletions: &std::collections::BTreeSet<String>,
+    target: &CandidateAuditTarget,
+) -> Result<(CompileFile, CompileCandidateAudit), BackendError> {
+    let mut content = read_markdown(workspace, "wiki/log.md", false)?.unwrap_or_default();
+    let record = candidate_audit_record(plan, sources, dependencies, generated, deletions);
+    // 审计文件 = 元数据（任务编号、时间、对应的日志页、说明）+ 与 V7 相同的记录本体。
+    let document = serde_json::json!({
+        "schemaVersion": 1,
+        "kind": CANDIDATE_AUDIT_KIND,
+        "compileTaskId": target.compile_task_id,
+        "generatedAt": target.generated_at,
+        "logPath": "wiki/log.md",
+        "explanation": candidate_audit_explanation(language),
+        "record": record,
+    });
+    let mut audit_text =
+        serde_json::to_string_pretty(&document).map_err(|error| invalid(&error.to_string()))?;
+    audit_text.push('\n');
+    if audit_text.len() > MAX_CANDIDATE_AUDIT_BYTES {
         return Err(invalid(
-            "The candidate log entry exceeds its bounded audit-record budget.",
+            "The candidate audit record exceeds its bounded audit-record budget.",
         ));
     }
-    content.push_str(&entry);
-    Ok(CompileFile::new("wiki/log.md", content))
+    let generated_paths = generated
+        .iter()
+        .map(|file| file.path.as_str())
+        .chain(std::iter::once("wiki/log.md"))
+        .collect::<Vec<_>>();
+    content.push_str(&candidate_log_summary(
+        language,
+        target,
+        plan,
+        sources,
+        dependencies.len(),
+        &generated_paths,
+        deletions.len(),
+    ));
+    Ok((
+        CompileFile::new("wiki/log.md", content),
+        CompileCandidateAudit { path: target.audit_path.clone(), content: audit_text },
+    ))
 }
 
 fn bounded_log_text(text: &str) -> String {
@@ -613,8 +952,21 @@ fn page_prompt(
     page_prompt_parts(
         workspace, language, plan, target, sources, dependencies, generated, deletions,
         PageContextMode::Inline,
+        DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS,
     )
     .map(|parts| parts.inline)
+}
+
+/// V8：给 index.md / overview.md 的写法规则（替换 V7 的 "preserve existing history"）。
+///
+/// 做什么：要求就地更新导航，不追加"本轮/本次/历史阶段"这类逐批叙述小节；明确不得
+/// 删除任何已有的 raw/sources/... 引用（含 frontmatter 的 sources，index/overview 各有
+/// 约 300 条，重试脚本的轻量审阅按"旧引用只增不减"把关）；并告诉模型每批的增长上限，
+/// 超过会被后端整份拒绝。log.md 由后端本地追加，不用这条规则。
+fn structural_page_rule(target: &str, growth_limit_chars: usize) -> String {
+    format!(
+        "`{target}` is a navigation page: update its navigation in place. Edit existing entries or add one concise entry per new or materially changed derived page; do not append per-batch narrative, changelog or history sections (no sections titled 本轮, 本次, 历史阶段, this round, this batch or history). Never delete any existing `raw/sources/...` citation, including frontmatter `sources` entries. This batch may grow this page by at most {growth_limit_chars} characters; a larger candidate is rejected as a whole (COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED), never truncated."
+    )
 }
 
 /// 逐页提示的组装方式。
@@ -671,14 +1023,23 @@ fn page_prompt_parts(
     generated: &[CompileFile],
     deletions: &std::collections::BTreeSet<String>,
     mode: PageContextMode,
+    structural_growth_limit_chars: usize,
 ) -> Result<PagePromptParts, BackendError> {
     let baseline = large_page_baseline(workspace, target)?;
+    // V8：index/overview 用"就地更新导航"规则；派生页仍要求保留未改动的知识和历史。
+    // log.md 不会走到模型这里（后端本地追加），所以只需区分这两类。
+    let navigation = matches!(target, "wiki/index.md" | "wiki/overview.md");
     let mut prompt = if let Some(baseline) = &baseline {
         format!(
-            "Return only PageEdits JSON matching {{path,baseSha256,edits:[{{before,after}}],deletions:[\"wiki/...md\"]}}. Follow the accepted CompilePlan. {access}\n{}\n{}\nGenerate only `{target}`. Return edits against the complete baseline below, with baseSha256 `{hash}`. Each nonempty before string must occur exactly once in the ORIGINAL baseline; all edits refer to that same baseline, must not overlap, and may not depend on earlier edits. Include enough adjacent text to identify an insertion point. Preserve all unchanged knowledge, history, citations and formatting. Return at most 32 edits and at most 64 KiB JSON; do not return the full page or a files array. {deletion_policy} Empty edits mean this page is unchanged. The backend reconstructs the entire candidate and subjects it to normal validation and review. Write new prose in the specified language.\n",
+            "Return only PageEdits JSON matching {{path,baseSha256,edits:[{{before,after}}],deletions:[\"wiki/...md\"]}}. Follow the accepted CompilePlan. {access}\n{}\n{}\nGenerate only `{target}`. Return edits against the complete baseline below, with baseSha256 `{hash}`. Each nonempty before string must occur exactly once in the ORIGINAL baseline; all edits refer to that same baseline, must not overlap, and may not depend on earlier edits. Include enough adjacent text to identify an insertion point. {preserve} Return at most 32 edits and at most 64 KiB JSON; do not return the full page or a files array. {deletion_policy} Empty edits mean this page is unchanged. The backend reconstructs the entire candidate and subjects it to normal validation and review. Write new prose in the specified language.\n",
             crate::services::render_compile_core_instructions_with_policy(true),
             crate::utils::i18n::language_instruction(language),
             hash = format!("{:x}", Sha256::digest(baseline.as_bytes())),
+            preserve = if navigation {
+                structural_page_rule(target, structural_growth_limit_chars)
+            } else {
+                "Preserve all unchanged knowledge, history, citations and formatting.".to_string()
+            },
             deletion_policy = if is_structural_page(target) { "Return empty deletions; navigation pages cannot propose removals." } else { "Deletions may only propose obsolete derived pages justified by the accepted plan, exactly as for full-page responses; normal validation and review remain required. Do not delete a page generated by the plan." },
             access = page_access_instruction(mode),
         )
@@ -696,6 +1057,11 @@ fn page_prompt_parts(
         header.push_str(&format!(
             "\nGenerate only `{target}`. This response is one page fragment, not the complete manifest. Return exactly one files entry for that target, with its complete Markdown content. The three scaffold pages are generated in separate requests; do not return them unless this request names that page. Deletions may only propose obsolete derived pages justified by the accepted plan; they remain subject to the normal review gate. Do not delete a page generated by the plan.\n"
         ));
+        // V8：小的或新建的 index/overview（整页返回）同样遵守"就地更新导航"规则和增长上限。
+        if navigation {
+            header.push_str(&structural_page_rule(target, structural_growth_limit_chars));
+            header.push('\n');
+        }
         header
     };
     if is_structural_page(target) && baseline.is_none() {
@@ -786,7 +1152,9 @@ fn page_prompt_parts(
         }
     }
     if is_structural_page(target) {
-        deferred.push_str("\n--- Generated derived pages; reflect their actual content and preserve existing history ---\n");
+        // V8：V7 这里写的是 "preserve existing history"，和"只做必要导航调整"冲突，
+        // 改成"按派生页实际内容就地更新导航"。
+        deferred.push_str("\n--- Generated derived pages; update navigation in place to reflect their actual content (no per-batch narrative; keep every existing raw/sources/... citation) ---\n");
         for file in generated
             .iter()
             .filter(|file| !is_structural_page(&file.path))
@@ -1202,7 +1570,7 @@ mod tests {
         plan.items[0].affected_existing_pages.push(related.into());
         let target = plan.items[0].target_path.clone();
         let request_for = |budget: &AgentInputBudget| {
-            page_request(budget, root.path(), "zh-CN", &plan, &target, &sources, &[], &[], &Default::default()).unwrap()
+            page_request(budget, DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, root.path(), "zh-CN", &plan, &target, &sources, &[], &[], &Default::default()).unwrap()
         };
         let claude_request = request_for(&default_budget(AgentKind::Claude));
         assert_eq!(claude_request.file_mode.as_ref().map(|mode| mode.transport), Some(PageTransportKind::Layered));
@@ -1320,7 +1688,7 @@ mod tests {
         plan.items[0].action = CompileAction::Update;
         let claude = default_budget(AgentKind::Claude);
         let request_for = |plan: &CompilePlan| {
-            page_request(&claude, root.path(), "zh-CN", plan, &target, &sources, &[], &[], &Default::default()).unwrap()
+            page_request(&claude, DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, root.path(), "zh-CN", plan, &target, &sources, &[], &[], &Default::default()).unwrap()
         };
         // 约 100KB（约 5 万 token）：超过 Claude 默认内联阈值 4 万、低于硬上限 10 万。
         std::fs::write(root.path().join(&target), format!("# Page\n{}MEDIUM_END", "x".repeat(100_000))).unwrap();
@@ -1828,15 +2196,16 @@ mod tests {
             "旧事实与引用不得重写。\r\n".repeat(50000)
         );
         std::fs::write(root.path().join("wiki/log.md"), &baseline).unwrap();
-        let mut targets = Vec::new();
-        let manifest = generate(root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
+        let targets = std::sync::Mutex::new(Vec::new());
+        let generated = generate_with_test_audit(root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
             let target = prompt.lines().find_map(|line| line.strip_prefix("Generate only `")?.split('`').next()).unwrap();
             assert_ne!(target, "wiki/log.md", "history must not be sent for full model regeneration");
-            targets.push(target.to_string());
+            targets.lock().unwrap().push(target.to_string());
             Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":"# Generated"}],"deletions":[]}).to_string())
-        }, |_, _, _| Ok(())).unwrap();
-        assert_eq!(targets.len(), 3);
-        let log = &manifest
+        }).unwrap();
+        assert_eq!(targets.into_inner().unwrap().len(), 3);
+        let log = &generated
+            .manifest
             .files
             .iter()
             .find(|file| file.path == "wiki/log.md")
@@ -1850,12 +2219,176 @@ mod tests {
             log.len() - baseline.len() < 16384,
             "new entry does not grow with old history"
         );
-        assert!(log.contains("bound-version") && log.contains("bound-hash"));
+        // V8：版本和哈希只在完整审计记录里，log.md 只有摘要（含页面路径）。
+        assert!(!log.contains("bound-version") && !log.contains("bound-hash"));
+        assert!(generated.audit.content.contains("bound-version") && generated.audit.content.contains("bound-hash"));
         assert!(log.contains("wiki/concepts/新知识.md"));
         assert_eq!(
             std::fs::read_to_string(root.path().join("wiki/log.md")).unwrap(),
             baseline
         );
+    }
+
+    /// 测试用：按固定的测试设置逐页生成，同时拿到候选清单和完整审计记录。
+    fn generate_with_test_audit(
+        workspace: &Path,
+        language: &str,
+        plan: &CompilePlan,
+        sources: &[ResolvedCompileSource],
+        dependencies: &[crate::models::compile::CompileSourceDependency],
+        complete: impl Fn(&str) -> Result<String, BackendError> + Sync,
+    ) -> Result<GeneratedPages, BackendError> {
+        generate_with_test_options(
+            &CandidateGenerationOptions::for_tests(), workspace, language, plan, sources, dependencies, complete,
+        )
+    }
+
+    /// 测试用：同上，但可以指定设置（例如更小的结构页增长上限）。
+    fn generate_with_test_options(
+        options: &CandidateGenerationOptions,
+        workspace: &Path,
+        language: &str,
+        plan: &CompilePlan,
+        sources: &[ResolvedCompileSource],
+        dependencies: &[crate::models::compile::CompileSourceDependency],
+        complete: impl Fn(&str) -> Result<String, BackendError> + Sync,
+    ) -> Result<GeneratedPages, BackendError> {
+        generate_pages_with_options(
+            default_budget(AgentKind::Codex), options, workspace, language, plan, sources, dependencies,
+            |_, prompt, _, _| complete(prompt), |_, _, _| Ok(()),
+        )
+    }
+
+    /// 测试用：一条历史来源依赖。
+    fn test_dependency(index: usize) -> crate::models::compile::CompileSourceDependency {
+        crate::models::compile::CompileSourceDependency {
+            source_version: SourceVersionRef {
+                source_id: format!("historical-source-{index}"),
+                version_id: format!("historical-version-{index}"),
+                content_hash: format!("{:064x}", index),
+            },
+            project_path: format!("raw/sources/local/historical-{index:03}.md"),
+            workspace_path: format!("raw/sources/local/historical-{index:03}.md"),
+            file_hash: format!("{:064x}", index + 1),
+        }
+    }
+
+    // V8 改动集 C：审计 JSON 不再进入 wiki/log.md；log 只追加标题 + 3 行、不超过 2KB 的
+    // 摘要，且包含本批每条所选来源的路径和审计文件路径；完整审计文件的 record 与 V7
+    // 写进 log 的 JSON 结构、取值完全相同。
+    #[test]
+    fn candidate_log_appends_a_small_summary_and_the_full_audit_keeps_the_v7_record() {
+        let (root, mut plan, mut sources) = fixture();
+        std::fs::create_dir_all(root.path().join("raw/sources/local")).unwrap();
+        // 再加两条本批来源（真实知识库的路径形态），其中一条计划暂缓。
+        for (index, id) in ["0123456789abcdef01234567", "89abcdef0123456789abcdef"].iter().enumerate() {
+            let mut source = sources[0].clone();
+            source.project_path = format!("raw/sources/local/{id}.md");
+            source.workspace_path = source.project_path.clone();
+            source.reference.source_id = format!("selected-source-{index}");
+            source.reference.version_id = format!("selected-version-{index}");
+            sources.push(source);
+        }
+        plan.source_decisions.push(crate::models::compile::CompilePlanSourceDecision {
+            source_id: sources[2].workspace_path.clone(),
+            status: crate::models::compile::CompileSourceOutcomeStatus::Deferred,
+            reason: "未分析画面，等待相关证据".into(),
+            evidence_path: None,
+            evidence_excerpt: None,
+        });
+        // 40 条旧来源依赖：V7 时它们占了日志条目的大头。
+        let dependencies = (0..40).map(test_dependency).collect::<Vec<_>>();
+        let baseline_log = "# Existing log\nHistorical fact must survive.";
+        let generated = generate_with_test_audit(root.path(), "zh-CN", &plan, &sources, &dependencies, |prompt| {
+            Ok(fragment(prompt))
+        }).unwrap();
+        let log = &generated.manifest.files.iter().find(|file| file.path == "wiki/log.md").unwrap().content;
+        assert!(log.starts_with(baseline_log));
+        let appended = &log[baseline_log.len()..];
+        // 1. 不再有审计 JSON。
+        for forbidden in ["```json", "readOnlyDependencies", "selectedScope", "sourceVersion", "historical-version-0", "raw/sources/local/historical-000.md"] {
+            assert!(!appended.contains(forbidden), "{forbidden} must stay out of wiki/log.md");
+        }
+        // 2. 小：不超过 2KB；标题 + 恰好 3 行。
+        assert!(appended.len() <= 2048, "log entry is {} bytes", appended.len());
+        let lines = appended.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4, "{appended}");
+        assert_eq!(lines[0], "### Update Wiki candidate record", "the V7 heading is kept for counting");
+        // 3. 包含每条所选来源的路径（含暂缓的），以及时间、任务编号、审计文件路径。
+        for source in &sources {
+            assert!(appended.contains(&source.project_path), "missing {}", source.project_path);
+        }
+        let options = CandidateGenerationOptions::for_tests();
+        assert!(appended.contains(&options.audit.generated_at));
+        assert!(appended.contains(&options.audit.compile_task_id));
+        assert!(appended.contains(&options.audit.audit_path));
+        assert!(appended.contains("本批来源 3 条") && appended.contains("暂缓 1"));
+        assert!(appended.contains("旧来源依赖 40 条"));
+        assert!(appended.contains("not consumption"));
+        // 摘要里出现的 raw/sources/... 引用只能是本批所选来源（重试脚本的轻量审阅要求）。
+        let selected = sources.iter().map(|source| source.project_path.as_str()).collect::<HashSet<_>>();
+        for (start, _) in appended.match_indices("raw/sources/local/") {
+            let end = appended[start..].find(".md").unwrap() + start + 3;
+            assert!(selected.contains(&appended[start..end]), "unexpected reference {}", &appended[start..end]);
+        }
+        // 4. 完整审计文件：路径是任务编号对应的文件，record 与 V7 写进 log 的 JSON 等价。
+        assert_eq!(generated.audit.path, options.audit.audit_path);
+        let audit: serde_json::Value = serde_json::from_str(&generated.audit.content).unwrap();
+        assert_eq!(audit["kind"], CANDIDATE_AUDIT_KIND);
+        assert_eq!(audit["compileTaskId"], options.audit.compile_task_id.as_str());
+        assert_eq!(audit["generatedAt"], options.audit.generated_at.as_str());
+        assert_eq!(audit["logPath"], "wiki/log.md");
+        assert!(audit["explanation"].as_str().unwrap().contains("历史依赖仅供引用（read-only）"));
+        let target = &plan.items[0].target_path;
+        let expected_record = serde_json::json!({
+            "stage": "candidate_only_not_consumption",
+            "summary": plan.summary,
+            "generatedPaths": [target, "wiki/index.md", "wiki/overview.md", "wiki/log.md"],
+            "selectedScope": [
+                {"path": sources[0].project_path, "sourceVersion": sources[0].reference,
+                    "plannedStatus": "planned_integration_pending_validation", "reason": null},
+                {"path": sources[1].project_path, "sourceVersion": sources[1].reference,
+                    "plannedStatus": "planned_integration_pending_validation", "reason": null},
+                {"path": sources[2].project_path, "sourceVersion": sources[2].reference,
+                    "plannedStatus": "deferred", "reason": "未分析画面，等待相关证据"},
+            ],
+            "readOnlyDependencies": dependencies.iter().map(|dependency| serde_json::json!({
+                "path": dependency.project_path, "sourceVersion": dependency.source_version
+            })).collect::<Vec<_>>(),
+            "proposedDeletions": ["wiki/concepts/obsolete.md"],
+        });
+        assert_eq!(audit["record"], expected_record);
+        assert_eq!(
+            audit["record"].as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            ["generatedPaths", "proposedDeletions", "readOnlyDependencies", "selectedScope", "stage", "summary"]
+                .into_iter().collect::<std::collections::BTreeSet<_>>(),
+            "exactly the V7 log record fields"
+        );
+        // 5. 审计文件不在 wiki/ 下，也没写进候选工作区（只随候选返回，应用时才落盘）。
+        assert!(!generated.audit.path.starts_with("wiki/"));
+        assert!(generated.manifest.files.iter().all(|file| file.path.starts_with("wiki/")));
+        assert!(!root.path().join(&generated.audit.path).exists());
+    }
+
+    // 受影响页面很多时，摘要只列到字节预算为止，其余只写数量；所选来源路径一条不省。
+    #[test]
+    fn candidate_log_summary_bounds_long_page_lists_but_keeps_every_selected_source() {
+        let (_, plan, sources) = fixture();
+        let pages = (0..200).map(|index| format!("wiki/concepts/很长的页面名称-{index:03}.md")).collect::<Vec<_>>();
+        let page_refs = pages.iter().map(String::as_str).collect::<Vec<_>>();
+        let summary = candidate_log_summary(
+            "zh-CN", &CandidateGenerationOptions::for_tests().audit, &plan, &sources, 3, &page_refs, 0,
+        );
+        assert!(summary.len() <= 2048, "summary is {} bytes", summary.len());
+        assert!(summary.contains("受影响页面 200 个"));
+        assert!(summary.contains("见审计记录"));
+        assert!(summary.contains(&sources[0].project_path));
+        let english = candidate_log_summary(
+            "en-US", &CandidateGenerationOptions::for_tests().audit, &plan, &sources, 3, &page_refs, 2,
+        );
+        assert!(english.len() <= 2048);
+        assert!(english.contains("200 affected pages") && english.contains("more in the audit record"));
+        assert!(english.contains("2 proposed deletions"));
     }
 
     #[test]
@@ -1885,21 +2418,29 @@ mod tests {
             workspace_path: "raw/sources/历史.md".into(),
             file_hash: "historical-file-hash".into(),
         }];
-        let manifest = generate(root.path(), "zh-CN", &plan, &sources, &dependencies, |prompt| {
+        let generated = generate_with_test_audit(root.path(), "zh-CN", &plan, &sources, &dependencies, |prompt| {
             let target = prompt.lines().find_map(|line| line.strip_prefix("Generate only `")?.split('`').next()).unwrap();
             assert_ne!(target, "wiki/log.md");
             Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":"# Generated"}],"deletions":[]}).to_string())
-        }, |_, _, _| Ok(())).unwrap();
-        let log = &manifest
+        }).unwrap();
+        let log = &generated
+            .manifest
             .files
             .iter()
             .find(|file| file.path == "wiki/log.md")
             .unwrap()
             .content;
-        assert!(log.contains("deferred") && log.contains("deferred-version"));
-        assert!(log.contains("未分析画面，等待相关证据"));
-        assert!(log.contains("historical-source") && log.contains("historical-version"));
-        assert!(log.contains("not consumption") && log.contains("read-only"));
+        // V8：选中范围的计划状态、暂缓原因和旧来源依赖都完整保留在审计记录里。
+        let audit = &generated.audit.content;
+        assert!(audit.contains("deferred") && audit.contains("deferred-version"));
+        assert!(audit.contains("未分析画面，等待相关证据"));
+        assert!(audit.contains("historical-source") && audit.contains("historical-version"));
+        assert!(audit.contains("not consumption") && audit.contains("read-only"));
+        assert!(!audit.contains("UNSELECTED_PRIVATE_TEXT"));
+        // log.md 只有摘要：记下暂缓数量、旧依赖条数和"不代表消费"，不再有逐条依赖。
+        assert!(log.contains("暂缓 1") && log.contains("旧来源依赖 1 条"));
+        assert!(log.contains("not consumption"));
+        assert!(!log.contains("historical-source") && !log.contains("historical-version"));
         assert!(!log.contains("UNSELECTED_PRIVATE_TEXT"));
     }
 
@@ -1918,6 +2459,164 @@ mod tests {
             .content;
         assert!(log.contains("Candidate generation does not imply application"));
         assert!(!log.contains("候选生成记录"));
+    }
+
+    /// 测试用：把结构页增长上限改成指定值的设置。
+    fn options_with_growth_limit(limit: usize) -> CandidateGenerationOptions {
+        CandidateGenerationOptions { structural_growth_limit_chars: limit, ..CandidateGenerationOptions::for_tests() }
+    }
+
+    // V8 硬闸门：index/overview 候选相对原文增长超过上限就整份拒绝（明确错误码和计数），
+    // 正好等于上限、缩短都放行；按字符而不是字节计数；派生页不受这个闸门限制。
+    #[test]
+    fn structural_page_growth_over_the_limit_is_rejected_and_within_the_limit_passes() {
+        let limit = 1_000;
+        let run = |index_body: Option<String>, overview_body: Option<String>, derived_body: Option<String>| {
+            let (root, plan, sources) = fixture();
+            std::fs::write(root.path().join("wiki/index.md"), "# Index\n原有导航\n").unwrap();
+            std::fs::write(root.path().join("wiki/overview.md"), "# Overview\n").unwrap();
+            let result = generate_with_test_options(&options_with_growth_limit(limit), root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
+                let target = requested_target(prompt);
+                let body = match target {
+                    "wiki/index.md" => index_body.clone(),
+                    "wiki/overview.md" => overview_body.clone(),
+                    _ => derived_body.clone(),
+                };
+                match body {
+                    Some(content) => Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":content}],"deletions":[]}).to_string()),
+                    None => Ok(fragment(prompt)),
+                }
+            });
+            // 闸门只拒绝候选，绝不改动工作区里的原文。
+            assert_eq!(std::fs::read_to_string(root.path().join("wiki/index.md")).unwrap(), "# Index\n原有导航\n");
+            result
+        };
+        let index_baseline_chars = "# Index\n原有导航\n".chars().count();
+        // 超过上限 1 个字符：拒绝，details 写明增长量和上限。
+        let error = run(Some(format!("# Index\n原有导航\n{}", "新".repeat(limit + 1))), None, None).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        let details = error.details.unwrap();
+        assert_eq!(details["path"], "wiki/index.md");
+        assert_eq!(details["growthCharacters"], limit + 1);
+        assert_eq!(details["limitCharacters"], limit);
+        assert_eq!(details["baselineCharacters"], index_baseline_chars);
+        assert_eq!(details["candidateCharacters"], index_baseline_chars + limit + 1);
+        assert!(!format!("{details}").contains("新新"), "errors carry counts, never page bodies");
+        // 正好等于上限（3 字节的汉字按 1 个字符算）：放行，内容原样进入候选。
+        let exact = format!("# Index\n原有导航\n{}", "新".repeat(limit));
+        let manifest = run(Some(exact.clone()), None, None).unwrap().manifest;
+        assert_eq!(manifest.files.iter().find(|file| file.path == "wiki/index.md").unwrap().content, exact);
+        // 缩短放行。
+        assert!(run(Some("# Index\n".into()), None, None).is_ok());
+        // overview 同样受限。
+        let error = run(None, Some(format!("# Overview\n{}", "x".repeat(limit + 1))), None).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        assert_eq!(error.details.unwrap()["path"], "wiki/overview.md");
+        // 派生页不受结构页闸门限制。
+        let big_derived = format!(
+            "---\ntype: concept\nsources: [\"raw/sources/中文 资料/来源.md\"]\n---\n# 新知识\n{}",
+            "派生页正文\n".repeat(2_000)
+        );
+        assert!(run(None, None, Some(big_derived)).is_ok());
+    }
+
+    // 大页面走 PageEdits 时同样受闸门约束：增长按"重建后的整页"相对基线计算。
+    #[test]
+    fn structural_growth_gate_also_covers_page_edits_and_new_navigation_pages() {
+        let (root, plan, sources) = fixture();
+        let baseline = format!("# Index\n{}\nUNIQUE_ANCHOR\n", "历史导航条目\n".repeat(6_000));
+        std::fs::write(root.path().join("wiki/index.md"), &baseline).unwrap();
+        let limit = 2_000;
+        let edit = |extra: usize| {
+            let baseline = baseline.clone();
+            move |prompt: &str| -> Result<String, BackendError> {
+                if requested_target(prompt) == "wiki/index.md" {
+                    Ok(serde_json::json!({"path":"wiki/index.md","baseSha256":hash_bytes(baseline.as_bytes()),
+                        "edits":[{"before":"UNIQUE_ANCHOR","after":format!("UNIQUE_ANCHOR\n{}", "页".repeat(extra))}]}).to_string())
+                } else {
+                    Ok(fragment(prompt))
+                }
+            }
+        };
+        let options = options_with_growth_limit(limit);
+        // 插入 "\n" + limit 个字符 = 增长 limit + 1：拒绝。
+        let error = generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], edit(limit)).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        assert_eq!(error.details.unwrap()["growthCharacters"], limit + 1);
+        assert!(generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], edit(limit - 1)).is_ok());
+        // 还不存在的 overview（新知识库第一批）：按原文 0 字符计算增长。
+        let (root, plan, sources) = fixture();
+        let error = generate_with_test_options(&options, root.path(), "zh-CN", &plan, &sources, &[], |prompt| {
+            let target = requested_target(prompt);
+            if target == "wiki/overview.md" {
+                Ok(serde_json::json!({"summary":"fragment","files":[{"path":target,"content":"概".repeat(limit + 1)}],"deletions":[]}).to_string())
+            } else {
+                Ok(fragment(prompt))
+            }
+        }).unwrap_err();
+        assert_eq!(error.code, "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED");
+        assert_eq!(error.details.unwrap()["baselineCharacters"], 0);
+    }
+
+    // 增长上限的环境变量只接受合法范围内的正整数，其余回退默认值。
+    #[test]
+    fn structural_growth_limit_override_is_bounded() {
+        assert_eq!(DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, 4_000);
+        assert_eq!(parse_structural_growth_limit(None), DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS);
+        assert_eq!(parse_structural_growth_limit(Some(" 8000 ")), 8_000);
+        for bad in ["", "0", "-1", "abc", "499", "200001", "99999999999"] {
+            assert_eq!(parse_structural_growth_limit(Some(bad)), DEFAULT_STRUCTURAL_PAGE_GROWTH_LIMIT_CHARS, "{bad}");
+        }
+    }
+
+    // V8：给 index/overview 的提示不再要求"preserve existing history"，改为就地更新导航、
+    // 不追加逐批叙述、不删任何已有 raw/sources/... 引用，并写明增长上限；派生页提示不变。
+    #[test]
+    fn navigation_prompts_update_in_place_instead_of_preserving_history() {
+        let (root, plan, sources) = fixture();
+        let generated = vec![CompileFile::new("wiki/concepts/新知识.md", "# 新知识")];
+        let rule_markers = [
+            "update its navigation in place",
+            "do not append per-batch narrative",
+            "本轮, 本次, 历史阶段",
+            "Never delete any existing `raw/sources/...` citation, including frontmatter `sources` entries",
+            "at most 4000 characters",
+            "COMPILE_STRUCTURAL_PAGE_GROWTH_EXCEEDED",
+        ];
+        let prompt_for = |target: &str| {
+            page_prompt(root.path(), "zh-CN", &plan, target, &sources, &[], &generated, &Default::default()).unwrap()
+        };
+        // 小的/新建的导航页（整页返回）。
+        for target in ["wiki/index.md", "wiki/overview.md"] {
+            let prompt = prompt_for(target);
+            for marker in rule_markers {
+                assert!(prompt.contains(marker), "{target} prompt lacks {marker}");
+            }
+            assert!(!prompt.contains("preserve existing history"));
+            assert!(prompt.contains("--- Generated derived pages; update navigation in place"));
+        }
+        // 大的导航页（PageEdits）：规则替换掉"保留全部历史"那句。
+        std::fs::write(root.path().join("wiki/index.md"), format!("# Index\n{}", "导航\n".repeat(20_000))).unwrap();
+        let prompt = prompt_for("wiki/index.md");
+        assert!(prompt.contains("Return only PageEdits JSON"));
+        for marker in rule_markers {
+            assert!(prompt.contains(marker), "large index prompt lacks {marker}");
+        }
+        assert!(!prompt.contains("Preserve all unchanged knowledge, history"));
+        assert!(!prompt.contains("preserve existing history"));
+        // 派生页：小页不带导航规则；大页仍要求保留未改动的知识、历史和引用。
+        let derived = &plan.items[0].target_path;
+        assert!(!prompt_for(derived).contains("update its navigation in place"));
+        std::fs::write(root.path().join(derived), format!("# Page\n{}", "知识\n".repeat(20_000))).unwrap();
+        let prompt = prompt_for(derived);
+        assert!(prompt.contains("Preserve all unchanged knowledge, history, citations and formatting."));
+        assert!(!prompt.contains("update its navigation in place"));
+        // 上限来自设置：换一个上限，提示里的数字跟着变。
+        let custom = page_prompt_parts(
+            root.path(), "zh-CN", &plan, "wiki/overview.md", &sources, &[], &generated, &Default::default(),
+            PageContextMode::Inline, 1_234,
+        ).unwrap().inline;
+        assert!(custom.contains("at most 1234 characters"));
     }
 
     #[test]

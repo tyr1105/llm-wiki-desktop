@@ -1272,7 +1272,12 @@ fn apply_persisted_update_wiki_candidate(
     sink.complete(REVIEW_RISK).map_err(task_error)?;
     sink.start(APPLY_CHANGES).map_err(task_error)?;
 
-    let metadata_paths = compile_output_backup_paths(context, task_id, &descriptor.candidate.consumed_source_versions())?;
+    let metadata_paths = compile_output_backup_paths(
+        context,
+        task_id,
+        &descriptor.candidate.consumed_source_versions(),
+        candidate_audit_path(&descriptor.candidate),
+    )?;
     let mut backup = CompileService::backup_workflow_outputs(
         context,
         &descriptor.candidate.manifest,
@@ -1488,21 +1493,41 @@ fn current_manifest_hashes(
     Ok(hashes)
 }
 
+/// V8：候选里带的审计文件路径（没有审计记录的旧候选、BYOK 候选返回 None）。
+fn candidate_audit_path(candidate: &CompileCandidate) -> Option<&str> {
+    candidate
+        .audit_record
+        .as_ref()
+        .map(|audit| audit.path.as_str())
+}
+
+/// 应用阶段要一起写、一起进检查点、一起回滚的元数据文件：CompileRecord、各来源的
+/// 登记清单，以及（V8）候选审计文件。审计文件放在这里，它就和 CompileRecord 一样：
+/// 应用前在"before"检查点里记为不存在、写进"planned"日志、失败时由备份回滚删除。
 fn compile_metadata_paths(
     context: &ProjectContext,
     task_id: &str,
     sources: &[SourceVersionRef],
+    audit_path: Option<&str>,
 ) -> Result<Vec<String>, BackendError> {
     let mut paths = vec![format!(".app/compile/{task_id}.json")];
     let source_paths = context.layout.source_paths()?;
     for source in sources.iter().filter(|source| !source.source_id.starts_with("legacy-")) {
         paths.push(source_paths.manifest(&source.source_id)?);
     }
+    if let Some(audit_path) = audit_path {
+        paths.push(audit_path.to_string());
+    }
     Ok(paths)
 }
 
-fn compile_output_backup_paths(context: &ProjectContext, task_id: &str, sources: &[SourceVersionRef]) -> Result<Vec<String>, BackendError> {
-    let mut paths = compile_metadata_paths(context, task_id, sources)?;
+fn compile_output_backup_paths(
+    context: &ProjectContext,
+    task_id: &str,
+    sources: &[SourceVersionRef],
+    audit_path: Option<&str>,
+) -> Result<Vec<String>, BackendError> {
+    let mut paths = compile_metadata_paths(context, task_id, sources, audit_path)?;
     paths.push(workflow_graph_cache_relative_path(context));
     paths.sort();
     paths.dedup();
@@ -1539,7 +1564,12 @@ fn checkpoint_reviewed_inputs(
         &paths,
         Some(&descriptor.current_hashes),
     )?;
-    paths = compile_metadata_paths(context, &run.task_id, &descriptor.candidate.consumed_source_versions())?;
+    paths = compile_metadata_paths(
+        context,
+        &run.task_id,
+        &descriptor.candidate.consumed_source_versions(),
+        candidate_audit_path(&descriptor.candidate),
+    )?;
     let metadata_before = services
         .git_service
         .capture_history_files(context, &paths, None)?;
@@ -1583,7 +1613,7 @@ fn prepare_planned_history(
         .collect::<Vec<_>>();
     affected_paths.sort();
     affected_paths.dedup();
-    let prepared = SourceRegistry::prepare_compile_consumption_with_policy(
+    let mut prepared = SourceRegistry::prepare_compile_consumption_with_policy(
         context,
         services.file_store,
         &CompileConsumptionRecord {
@@ -1596,6 +1626,13 @@ fn prepare_planned_history(
             checkpoint: checkpoint_hash.map(str::to_string),
         },
         allow_recompile,
+    )?;
+    // V8：候选审计文件并入同一批元数据写入（CompileRecord 的 7 个字段不变）。
+    install_candidate_audit(
+        context,
+        task_id,
+        descriptor.candidate.audit_record.as_ref(),
+        &mut prepared,
     )?;
     if &prepared.before != metadata_before {
         return Err(BackendError::new(
@@ -1616,6 +1653,42 @@ fn prepare_planned_history(
         )
     })?;
     Ok(prepared)
+}
+
+/// V8：把候选里的完整审计 JSON 加进"消费记录"这批准备好的元数据写入。
+///
+/// 做什么：核对审计记录（路径必须是本任务的审计文件、内容属于本任务、文件尚不存在），
+/// 然后在 `before` 里记"不存在"、在 `installed` 里放候选里保存的原样字节。
+///
+/// 为什么放在这里：候选清单（manifest）只允许 wiki/ 下的 Markdown 页面，重试脚本的轻量
+/// 审阅也要求改动路径都在 wiki/ 下，所以审计文件不能当成候选页面；它和 CompileRecord
+/// 同属"应用成功才算数"的元数据，并进同一批写入后自动获得同样的保证——
+///   * 写进"planned"检查点日志（进程中途退出也能恢复或回滚）；
+///   * 和 CompileRecord 在同一个文件事务里落盘（`PreparedCompileConsumption::commit`）；
+///   * 收尾失败时由备份回滚删除；审阅不通过、候选被丢弃时根本不会写。
+fn install_candidate_audit(
+    context: &ProjectContext,
+    task_id: &str,
+    audit: Option<&crate::models::compile::CompileCandidateAudit>,
+    prepared: &mut PreparedCompileConsumption,
+) -> Result<(), BackendError> {
+    let Some(audit) = audit else {
+        return Ok(());
+    };
+    CompileService::validate_candidate_audit(context, task_id, audit)?;
+    if prepared.before.contains_key(&audit.path) || prepared.installed.contains_key(&audit.path) {
+        return Err(BackendError::new(
+            "COMPILE_AUDIT_RECORD_INVALID",
+            "The candidate audit record collides with other compile metadata.",
+            false,
+            true,
+        ));
+    }
+    prepared.before.insert(audit.path.clone(), None);
+    prepared
+        .installed
+        .insert(audit.path.clone(), Some(audit.content.as_bytes().to_vec()));
+    Ok(())
 }
 
 fn persist_planned_history(
@@ -2739,7 +2812,7 @@ mod batch6_diff_summary_tests {
         let graph = workflow_graph_cache_relative_path(&context);
         FileStore.write_markdown(&context, &graph, "baseline graph").unwrap();
         let manifest = CompileManifest { files: vec![], deletions: vec![], summary: "metadata only".into() };
-        let extra = compile_output_backup_paths(&context, "task-1", &[]).unwrap();
+        let extra = compile_output_backup_paths(&context, "task-1", &[], None).unwrap();
         let mut backup = CompileService::backup_workflow_outputs(&context, &manifest, &extra).unwrap();
         FileStore.write_markdown(&context, &graph, "workflow graph").unwrap();
         CompileService::capture_workflow_installed_values(&context, &mut backup, std::slice::from_ref(&graph)).unwrap();
@@ -2756,7 +2829,7 @@ mod batch6_diff_summary_tests {
         let source = SourceVersionRef { source_id: "source-1".into(), version_id: "version-1".into(), content_hash: "a".repeat(64) };
         let registry_path = context.layout.source_paths().unwrap().manifest(&source.source_id).unwrap();
         FileStore.write_markdown(&context, &registry_path, "source metadata before apply").unwrap();
-        let paths = compile_metadata_paths(&context, "task-1", &[source]).unwrap();
+        let paths = compile_metadata_paths(&context, "task-1", &[source], None).unwrap();
         let before = GitService.capture_history_files(&context, &paths, None).unwrap();
         assert_eq!(before.get(&registry_path), Some(&Some(b"source metadata before apply".to_vec())));
         assert!(!before.contains_key(".app/sources/source-1.json"));
@@ -2881,6 +2954,108 @@ mod batch6_diff_summary_tests {
             .history_snapshot(&context, &task_id, "after")
             .unwrap()
             .is_none());
+    }
+
+    /// V8 改动集 C：候选审计文件只在应用阶段、和 CompileRecord 同一批写入；
+    /// 写入前先进"planned"检查点日志；路径或任务对不上的审计记录被拒绝。
+    #[test]
+    fn candidate_audit_is_journaled_and_written_with_the_compile_record_only_on_apply() {
+        let root = tempfile::tempdir().unwrap();
+        // 用兼容布局（真实知识库就是这种），确认路径落在 .app/compat/compile-audit/。
+        let mut context = ProjectContext::new("candidate-audit", root.path().to_path_buf());
+        context.layout.app_state_root = Some(".app/compat".into());
+        context.layout.source_state_root = Some(".app/compat/sources".into());
+        std::fs::create_dir_all(root.path().join(".app/compat")).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let audit_path = CompileService::candidate_audit_path(&context, &task_id).unwrap();
+        assert_eq!(audit_path, format!(".app/compat/compile-audit/{task_id}.json"));
+        let audit = crate::models::compile::CompileCandidateAudit {
+            path: audit_path.clone(),
+            content: serde_json::to_string_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "update_wiki_candidate_audit",
+                "compileTaskId": task_id,
+                "record": {"stage": "candidate_only_not_consumption", "readOnlyDependencies": []},
+            }))
+            .unwrap(),
+        };
+        // 应用前的"before"快照：审计文件和 CompileRecord 一样记为不存在。
+        let paths = compile_metadata_paths(&context, &task_id, &[], Some(&audit_path)).unwrap();
+        assert!(paths.contains(&audit_path));
+        let metadata_before = GitService.capture_history_files(&context, &paths, None).unwrap();
+        assert_eq!(metadata_before.get(&audit_path), Some(&None));
+        let checkpoint = GitService
+            .create_history_snapshot(&context, &task_id, "before", "before", None, &metadata_before)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        let record = CompileConsumptionRecord {
+            schema_version: 1,
+            compile_task_id: task_id.clone(),
+            route: CompileRoute::Agent,
+            consumed_at: "2026-10-25T00:00:00Z".into(),
+            source_versions: vec![],
+            affected_paths: vec!["wiki/log.md".into()],
+            checkpoint: Some(checkpoint.clone()),
+        };
+        let mut prepared =
+            SourceRegistry::prepare_compile_consumption(&context, &FileStore, &record).unwrap();
+        // 路径不是本任务的、或内容属于别的任务：拒绝，且不改动准备好的写入。
+        for bad in [
+            crate::models::compile::CompileCandidateAudit {
+                path: ".app/compat/compile/other.json".into(),
+                content: audit.content.clone(),
+            },
+            crate::models::compile::CompileCandidateAudit {
+                path: audit_path.clone(),
+                content: audit.content.replace(&task_id, "another-task"),
+            },
+        ] {
+            let error = install_candidate_audit(&context, &task_id, Some(&bad), &mut prepared)
+                .unwrap_err();
+            assert_eq!(error.code, "COMPILE_AUDIT_RECORD_INVALID");
+        }
+        assert!(!prepared.installed.contains_key(&audit_path));
+        install_candidate_audit(&context, &task_id, Some(&audit), &mut prepared).unwrap();
+        // 与生产代码相同的一致性检查：准备好的"before"必须等于检查点里记下的值。
+        assert_eq!(prepared.before, metadata_before);
+        let manifest = CompileManifest {
+            files: vec![CompileFile::new("wiki/log.md", "# Log\n")],
+            deletions: vec![],
+            summary: "audit".into(),
+        };
+        persist_planned_history(&context, &task_id, &manifest, Some(&checkpoint), &prepared, &GitService)
+            .unwrap();
+        // "planned"检查点日志里已有审计文件，但磁盘上还没有（应用前不生效）。
+        let planned = GitService.history_snapshot(&context, &task_id, "planned").unwrap().unwrap();
+        let journaled = GitService
+            .read_history_files(&context, &planned, std::slice::from_ref(&audit_path))
+            .unwrap();
+        assert_eq!(journaled[&audit_path].as_deref(), Some(audit.content.as_bytes()));
+        assert!(!root.path().join(&audit_path).exists());
+        // 应用成功：和 CompileRecord 同一个文件事务写入，字节与候选里保存的完全一致。
+        prepared.commit(&context).unwrap();
+        assert_eq!(std::fs::read_to_string(root.path().join(&audit_path)).unwrap(), audit.content);
+        assert!(root.path().join(format!(".app/compat/compile/{task_id}.json")).exists());
+        // 同一个任务编号不会写第二份审计记录。
+        let mut again =
+            SourceRegistry::prepare_compile_consumption_with_policy(&context, &FileStore, &CompileConsumptionRecord {
+                compile_task_id: "fresh-task".into(),
+                ..record.clone()
+            }, false)
+            .unwrap();
+        assert_eq!(
+            install_candidate_audit(&context, &task_id, Some(&audit), &mut again).unwrap_err().code,
+            "COMPILE_AUDIT_RECORD_EXISTS"
+        );
+        // 没有审计记录的旧候选 / BYOK 候选：什么都不加。
+        let before = again.installed.len();
+        install_candidate_audit(&context, "fresh-task", None, &mut again).unwrap();
+        assert_eq!(again.installed.len(), before);
+        assert!(!compile_metadata_paths(&context, "fresh-task", &[], None)
+            .unwrap()
+            .iter()
+            .any(|path| path.contains("compile-audit")));
     }
 
     #[test]

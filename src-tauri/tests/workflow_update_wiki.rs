@@ -795,6 +795,8 @@ fn delete_overwrite_broad_rewrite_and_conflict_review_is_persisted_as_waiting() 
     sink.start("review_risk").unwrap();
     let candidate = CompileCandidate {
         source_dependencies: Vec::new(),
+        // V8：这个用例手工构造候选，不经过逐页生成，没有审计记录。
+        audit_record: None,
         source_outcomes: vec![llm_wiki_desktop_lib::models::compile::CompileSourceOutcome {
             source_version,
             source_path: "raw/extracted/资料.md".into(),
@@ -1102,6 +1104,17 @@ async fn agent_page_batches_complete_without_requesting_an_entire_manifest() {
     assert!(log.starts_with(baseline_log));
     assert_eq!(log.matches("### Update Wiki candidate record").count(), 1);
     assert!(log.contains("not consumption"));
+    // V8：完整审计 JSON 不在 log.md 里，而是在应用成功时和 CompileRecord 一起写到
+    // 按任务编号保存的审计文件。
+    assert!(!log.contains("readOnlyDependencies"));
+    let audit = fs::read_to_string(
+        context
+            .app_dir
+            .join("compile-audit")
+            .join(format!("{}.json", run.task_id)),
+    )
+    .unwrap();
+    assert!(audit.contains("readOnlyDependencies") && audit.contains("candidate_only_not_consumption"));
     let Some(llm_wiki_desktop_lib::models::workflow::WorkflowResult::UpdateWiki {
         final_commit: Some(final_commit),
         ..

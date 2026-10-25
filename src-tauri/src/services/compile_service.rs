@@ -4,7 +4,8 @@ use std::path::{Component, Path};
 use crate::errors::BackendError;
 use crate::models::agent::{AgentDetectionState, AgentKind};
 use crate::models::compile::{
-    CompileAction, CompileCandidate, CompileChangeSummary, CompileConflictResolution, CompileFile,
+    CompileAction, CompileCandidate, CompileCandidateAudit, CompileChangeSummary,
+    CompileConflictResolution, CompileFile,
     CompileManifest, CompilePageType, CompilePlan, CompilePlanItem, CompileRoutePreference,
     CompileSourceOutcome, CompileSourceOutcomeStatus, ResolvedCompileRoute, SourceVersionRef,
 };
@@ -354,7 +355,9 @@ impl CompileService {
             .map(|settings| settings.language)
             .unwrap_or_else(|_| "en".to_string());
         let source_context = SourceContext::new(context, workspace, sources)?;
-        let (plan, manifest, source_dependencies) = match &route {
+        // V8 改动集 C：第四项是候选审计记录。只有 Agent 路线的工作流逐页生成（log.md 由
+        // 后端本地追加）才会产出它；BYOK 和旧的手动整理路线照旧没有。
+        let (plan, manifest, source_dependencies, audit_record) = match &route {
             ResolvedCompileRoute::Agent { agent, .. } => {
                 let installed = services.agent_service.detect_agent(*agent, true).state
                     == AgentDetectionState::Installed;
@@ -427,11 +430,23 @@ impl CompileService {
                     },
                 )?;
                 observer.begin_candidate_generation()?;
-                let manifest = if plan.items.is_empty() {
-                    empty_manifest(&plan)
+                let (manifest, audit_record) = if plan.items.is_empty() {
+                    (empty_manifest(&plan), None)
                 } else if policy == CompileGenerationPolicy::WorkflowReviewableDeletes {
-                    agent_pages::generate_with_parallel_scaffolds_for_agent(
+                    // V8：审计记录的落点（按任务编号）、生成时间和结构页增长上限。
+                    let options = agent_pages::CandidateGenerationOptions {
+                        audit: agent_pages::CandidateAuditTarget {
+                            compile_task_id: task_id.to_string(),
+                            generated_at: chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            audit_path: Self::candidate_audit_path(context, task_id)?,
+                        },
+                        structural_growth_limit_chars:
+                            agent_pages::structural_growth_limit_from_env(),
+                    };
+                    let generated = agent_pages::generate_with_parallel_scaffolds_for_agent(
                         *agent,
+                        &options,
                         workspace,
                         &language,
                         &plan,
@@ -492,7 +507,8 @@ impl CompileService {
                                 )
                                 .map_err(task_operation_error)
                         },
-                    )?
+                    )?;
+                    (generated.manifest, Some(generated.audit))
                 } else {
                     let prompt = Self::provider_manifest_prompt_with_policy(
                         workspace,
@@ -510,10 +526,13 @@ impl CompileService {
                         services.task_service,
                         task_id,
                     )?;
-                    Self::parse_manifest_with_policy(&raw, policy.allows_reviewable_deletions())?
+                    (
+                        Self::parse_manifest_with_policy(&raw, policy.allows_reviewable_deletions())?,
+                        None,
+                    )
                 };
                 observer.begin_validation()?;
-                (plan, manifest, dependencies)
+                (plan, manifest, dependencies, audit_record)
             }
             ResolvedCompileRoute::Byok { provider, model } => {
                 let providers = LlmService::list_providers(context)?;
@@ -702,7 +721,8 @@ impl CompileService {
                         );
                     }
                 }
-                (plan, manifest, dependencies)
+                // BYOK 由模型整页写 log.md，没有后端本地追加的审计记录。
+                (plan, manifest, dependencies, None)
             }
         };
         if policy == CompileGenerationPolicy::LegacyNoDeletes && !plan.source_decisions.is_empty() {
@@ -710,6 +730,7 @@ impl CompileService {
         }
         let candidate = CompileCandidate {
             source_dependencies,
+            audit_record,
             route,
             source_outcomes: source_outcomes_for_candidate(context, &plan, &manifest, sources)?,
             plan,
@@ -1603,6 +1624,79 @@ impl CompileService {
 
     pub fn validate_lint_repair_manifest(manifest: &CompileManifest) -> Result<(), BackendError> {
         Self::validate_manifest_with_policy(manifest, CompileGenerationPolicy::LintRepair)
+    }
+
+    /// V8：某个整理任务的候选审计文件在项目里的相对路径。
+    ///
+    /// 放在应用状态目录下的 `compile-audit/<任务编号>.json`（兼容布局是
+    /// `.app/compat/compile-audit/`，原生布局是 `.app/compile-audit/`）：
+    ///   * 在 wiki/ 和 raw/extracted 之外，编译、lint、搜索都不扫描，不会被拉进下一次整理；
+    ///   * 不放进 `.app/compile/`，因为那里的每个 JSON 都会被当成 CompileRecord 读取。
+    /// 任务编号只允许字母、数字、`-`、`_`，防止拼出越界路径。
+    pub(crate) fn candidate_audit_path(
+        context: &ProjectContext,
+        task_id: &str,
+    ) -> Result<String, BackendError> {
+        if task_id.is_empty()
+            || task_id.len() > 128
+            || !task_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Err(BackendError::new(
+                "COMPILE_AUDIT_RECORD_INVALID",
+                "The compile task id cannot name a candidate audit record.",
+                false,
+                true,
+            ));
+        }
+        let app_root = context
+            .layout
+            .app_state_root
+            .as_deref()
+            .unwrap_or(".app")
+            .trim_end_matches('/');
+        Ok(format!("{app_root}/compile-audit/{task_id}.json"))
+    }
+
+    /// V8：应用前核对候选里的审计记录：路径必须正好是本任务的审计文件、文件还不存在、
+    /// 内容是本任务的候选审计 JSON 且大小有界。候选文件本身已有权威哈希，这里是纵深防御，
+    /// 保证一份候选只能写它自己那一个审计文件。
+    pub(crate) fn validate_candidate_audit(
+        context: &ProjectContext,
+        task_id: &str,
+        audit: &CompileCandidateAudit,
+    ) -> Result<(), BackendError> {
+        let invalid = |message: &str| {
+            BackendError::new("COMPILE_AUDIT_RECORD_INVALID", message, false, true)
+                .with_details(serde_json::json!({ "path": audit.path }))
+        };
+        if audit.path != Self::candidate_audit_path(context, task_id)? {
+            return Err(invalid("The candidate audit record targets another path."));
+        }
+        if audit.content.len() > agent_pages::MAX_CANDIDATE_AUDIT_BYTES {
+            return Err(invalid("The candidate audit record exceeds its size budget."));
+        }
+        let document: serde_json::Value = serde_json::from_str(&audit.content)
+            .map_err(|_| invalid("The candidate audit record is not valid JSON."))?;
+        if document.get("kind").and_then(serde_json::Value::as_str)
+            != Some(agent_pages::CANDIDATE_AUDIT_KIND)
+            || document.get("compileTaskId").and_then(serde_json::Value::as_str) != Some(task_id)
+            || !document.get("record").is_some_and(serde_json::Value::is_object)
+        {
+            return Err(invalid("The candidate audit record belongs to another task."));
+        }
+        // 和 CompileRecord 一样只新建、不覆盖：同一个任务编号不会有第二份审计记录。
+        if context.resolve_project_path(&audit.path)?.exists() {
+            return Err(BackendError::new(
+                "COMPILE_AUDIT_RECORD_EXISTS",
+                "This Compile task already has a candidate audit record.",
+                false,
+                true,
+            )
+            .with_details(serde_json::json!({ "path": audit.path })));
+        }
+        Ok(())
     }
 
     fn validate_manifest_with_policy(

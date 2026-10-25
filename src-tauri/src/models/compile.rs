@@ -89,6 +89,30 @@ pub struct CompileCandidate {
     /// Backend-bound historical evidence. It never expands the consumption scope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_dependencies: Vec<CompileSourceDependency>,
+    /// V8：本批候选的完整审计记录（V7 时整段 JSON 追加在 wiki/log.md 里）。
+    ///
+    /// 做什么：随候选一起持久化（候选文件有权威哈希，审阅期间改不了），只有审阅通过、
+    /// 应用成功时才和 CompileRecord 在同一个文件事务里写到 `.app/.../compile-audit/`；
+    /// 审阅不通过、候选被丢弃时它也随之消失，不会单独生效。
+    ///
+    /// 为什么：审计 JSON 里约 79% 是旧来源依赖清单，每批让 log.md 涨约 1 万字符；
+    /// 而 CompileRecord 只有 7 个字段，不含这些信息，不能直接丢。旧候选没有这个字段
+    /// （默认 None），照旧可以读取和应用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_record: Option<CompileCandidateAudit>,
+}
+
+/// V8：候选审计文件——写到哪里、写什么（逐字节）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompileCandidateAudit {
+    /// 项目内相对路径（已按项目布局映射），例如 `.app/compat/compile-audit/<任务编号>.json`。
+    /// 放在 wiki/ 和 raw/extracted 之外：编译只扫描这两处，审计文件永远不会被
+    /// 当成页面或来源拉进下一次整理的上下文。
+    pub path: String,
+    /// 要写入的完整 JSON 文本。保存成文本而不是再序列化一次，保证审阅时看到的、
+    /// 检查点里记下的和最终落盘的是同一串字节。
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
