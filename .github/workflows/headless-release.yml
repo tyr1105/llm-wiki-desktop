@@ -173,25 +173,25 @@ jobs:
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
           cat > "$RUNNER_TEMP/notes.md" <<NOTES
-          LLM Wiki Desktop 无窗口后台（headless 分支）$VERSION，只支持 Apple 芯片的 Mac。
+          LLM Wiki Desktop 无窗口后台（headless 分支）${VERSION}，只支持 Apple 芯片的 Mac。
           Headless backend from the \`headless\` branch, Apple Silicon only. Not an official LLM Wiki Desktop release.
 
           | | |
           |---|---|
-          | 附件 / Asset | \`$NAME.tar.gz\` |
-          | SHA-256 | \`$SHA256\` |
-          | 大小 / Size | $SIZE bytes |
-          | 源码提交 / Source commit | \`$commit\` |
-          | 构建记录 / Build run | $RUN_URL |
+          | 附件 / Asset | \`${NAME}.tar.gz\` |
+          | SHA-256 | \`${SHA256}\` |
+          | 大小 / Size | ${SIZE} bytes |
+          | 源码提交 / Source commit | \`${commit}\` |
+          | 构建记录 / Build run | ${RUN_URL} |
 
           由 GitHub Actions 在干净的 macOS 构建机上编译。核对方法 / Verify:
 
           \`\`\`bash
-          shasum -a 256 $NAME.tar.gz
-          gh attestation verify $NAME.tar.gz --repo $GITHUB_REPOSITORY
+          shasum -a 256 ${NAME}.tar.gz
+          gh attestation verify ${NAME}.tar.gz --repo ${GITHUB_REPOSITORY}
           \`\`\`
 
-          用法和改动说明见 / Usage and changes: [HEADLESS.md](https://github.com/$GITHUB_REPOSITORY/blob/$commit/HEADLESS.md)
+          用法和改动说明见 / Usage and changes: [HEADLESS.md](https://github.com/${GITHUB_REPOSITORY}/blob/${commit}/HEADLESS.md)
           NOTES
           gh release create "$TAG" "$DIST/$NAME.tar.gz" "$DIST/$NAME.tar.gz.sha256" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
