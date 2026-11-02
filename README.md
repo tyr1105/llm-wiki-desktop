@@ -1,3 +1,5 @@
+> **About this fork:** this is the `headless` branch maintained by [tyr1105](https://github.com/tyr1105) for [xhs-wiki](https://github.com/tyr1105/xhs-wiki). It adds a loopback-only automation API and a windowless mode (`--serve-api --headless`) on top of upstream v2.0.6. It is not an official LLM Wiki Desktop release; see [HEADLESS.md](HEADLESS.md). For the desktop app, use the [upstream releases](https://github.com/StoneLL1/llm-wiki-desktop/releases).
+
 <div align="center">
   <img src="src/assets/app-logo.png" alt="LLM Wiki Desktop" width="88" />
   <h1>LLM Wiki Desktop</h1>

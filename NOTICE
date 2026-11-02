@@ -1,0 +1,16 @@
+LLM Wiki Desktop - headless branch
+https://github.com/tyr1105/llm-wiki-desktop (branch "headless")
+
+This product is a modified version of LLM Wiki Desktop
+(https://github.com/StoneLL1/llm-wiki-desktop), Copyright LLM Wiki Desktop
+Contributors, licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Based on upstream release app-v2.0.6. Modifications Copyright 2026 tyr1105,
+also licensed under the Apache License, Version 2.0: a loopback-only local
+automation API and windowless mode (--serve-api --headless), per-agent context
+budgets with bounded planning, read-only Claude compile invocations, compile
+audit records and structural page growth limits, agent failure
+classification, and parallel generation of derived pages.
+
+The modified and added files are listed in HEADLESS.md. The complete change
+history is the Git history of the "headless" branch.

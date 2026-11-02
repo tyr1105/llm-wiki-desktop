@@ -1,0 +1,199 @@
+# 无窗口后台（--serve-api --headless）的构建与发布。
+#
+# 为什么要在 Actions 里编译：Rust 会把编译机上的目录名（含用户名）编进程序，
+# 所以分发的程序必须在干净的构建机上编译，不能用个人电脑上编出来的文件。
+#
+# 触发方式：推送 headless-v<上游版本>-<本分支修订号> 形式的标签（例如
+# headless-v2.0.6-1），或在 Actions 页面手动选择一个已存在的标签重跑。
+# 产物：llm-wiki-headless-<版本>-aarch64-apple-darwin.tar.gz（程序 + 许可证 +
+# 说明）及其 SHA-256，发布为同名 Release 的附件，并附 GitHub 构建来源证明。
+name: Headless backend release
+
+on:
+  push:
+    tags:
+      - "headless-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing headless-vX.Y.Z-N tag to build and publish
+        required: true
+        type: string
+
+# 默认只读；需要写权限的只有下面这个任务，并且只给它需要的那几项。
+permissions:
+  contents: read
+
+concurrency:
+  group: headless-release
+  cancel-in-progress: false
+
+env:
+  # 和上游 CI 用同一个 Rust 版本，减少"上游能编、这里编不过"的意外。
+  RUST_VERSION: 1.92.0
+  TARGET: aarch64-apple-darwin
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build and publish (aarch64-apple-darwin)
+    # macos-15 是 Apple 芯片的构建机。
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: write      # 创建 Release、上传附件
+      id-token: write      # 生成构建来源证明需要的 OIDC 令牌
+      attestations: write  # 写入构建来源证明
+    steps:
+      - name: Checkout the requested tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Derive version and asset name from the tag
+        id: meta
+        run: |
+          set -euo pipefail
+          # 标签必须是 headless-v<数字>.<数字>.<数字>-<数字>，其他写法一律拒绝，
+          # 避免奇怪的字符进入文件名和发布说明。
+          version="${TAG#headless-v}"
+          if [[ "$TAG" != headless-v* || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+            echo "Unexpected tag: $TAG" >&2
+            exit 1
+          fi
+          upstream="${version%-*}"
+          # 标签里的上游版本必须和 Cargo.toml 里的版本一致。
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)"
+          if [ "$cargo_version" != "$upstream" ]; then
+            echo "Tag version $upstream does not match Cargo.toml $cargo_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=llm-wiki-headless-$version-$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pinned Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+
+      - name: Build the release binary
+        run: |
+          set -euo pipefail
+          # 把构建机上的目录换成固定前缀：Rust 代码用 remap-path-prefix，
+          # 依赖里的 C 代码用 -ffile-prefix-map。只影响报错信息里的路径，
+          # 不影响程序行为。
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build/llm-wiki-desktop --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
+          export CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/build/llm-wiki-desktop -ffile-prefix-map=$HOME/.cargo=/cargo"
+          # 只编主程序，功能集与 --serve-api --headless 需要的一致（local-api 已包含 gui）。
+          cargo build --release --locked --target "$TARGET" \
+            --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features local-api \
+            --bin llm-wiki-desktop
+
+      - name: Check the code signature and run a headless smoke test
+        run: |
+          set -euo pipefail
+          bin="src-tauri/target/$TARGET/release/llm-wiki-desktop"
+          file "$bin"
+          # Apple 芯片上的程序必须带签名才能运行；链接器会自动做临时签名，
+          # 这里确认签名有效，无效就补签。
+          if ! codesign --verify --verbose=2 "$bin"; then
+            codesign --force --sign - "$bin"
+            codesign --verify --verbose=2 "$bin"
+          fi
+          echo "Build machine paths left in the binary: $(strings "$bin" | grep -c '/Users/runner' || true)"
+
+          # 冒烟测试：用临时 HOME 无窗口启动，等健康检查返回 ready 且窗口数为 0。
+          work="$(mktemp -d)"
+          mkdir -p "$work/home" "$work/project" "$work/import"
+          token="$(openssl rand -hex 32)"
+          port=18799
+          HOME="$work/home" LLM_WIKI_API_TOKEN="$token" "$bin" --serve-api --headless \
+            --api-port "$port" --project-root "$work/project" --import-root "$work/import" \
+            > "$work/stdout.log" 2> "$work/stderr.log" &
+          pid=$!
+          ok=0
+          for _ in $(seq 1 90); do
+            if body="$(curl -fsS --max-time 5 -H "Authorization: Bearer $token" "http://127.0.0.1:$port/api/v1/health" 2>/dev/null)"; then
+              if printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys.exit(0 if d.get("ready") is True and d.get("webviewWindowCount") == 0 else 1)'; then
+                printf '%s\n' "$body"
+                ok=1
+                break
+              fi
+            fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 2
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          if [ "$ok" != 1 ]; then
+            echo "Headless smoke test failed" >&2
+            tail -n 50 "$work/stderr.log" >&2 || true
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          stage="$dist/$NAME"
+          mkdir -p "$stage"
+          cp "src-tauri/target/$TARGET/release/llm-wiki-desktop" "$stage/llm-wiki-desktop"
+          cp LICENSE NOTICE HEADLESS.md "$stage/"
+          # 不带 macOS 扩展属性，属主统一，解压结果在任何机器上都一样。
+          (cd "$dist" && COPYFILE_DISABLE=1 tar --no-mac-metadata --uid 0 --gid 0 --uname root --gname wheel -czf "$NAME.tar.gz" "$NAME")
+          (cd "$dist" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          sha="$(cut -d ' ' -f 1 "$dist/$NAME.tar.gz.sha256")"
+          size="$(stat -f %z "$dist/$NAME.tar.gz")"
+          echo "dist=$dist" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          echo "SHA-256: $sha  size: $size bytes"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.dist }}/${{ steps.meta.outputs.name }}.tar.gz
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.meta.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          SIZE: ${{ steps.package.outputs.size }}
+          DIST: ${{ steps.package.outputs.dist }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          cat > "$RUNNER_TEMP/notes.md" <<NOTES
+          LLM Wiki Desktop 无窗口后台（headless 分支）$VERSION，只支持 Apple 芯片的 Mac。
+          Headless backend from the \`headless\` branch, Apple Silicon only. Not an official LLM Wiki Desktop release.
+
+          | | |
+          |---|---|
+          | 附件 / Asset | \`$NAME.tar.gz\` |
+          | SHA-256 | \`$SHA256\` |
+          | 大小 / Size | $SIZE bytes |
+          | 源码提交 / Source commit | \`$commit\` |
+          | 构建记录 / Build run | $RUN_URL |
+
+          由 GitHub Actions 在干净的 macOS 构建机上编译。核对方法 / Verify:
+
+          \`\`\`bash
+          shasum -a 256 $NAME.tar.gz
+          gh attestation verify $NAME.tar.gz --repo $GITHUB_REPOSITORY
+          \`\`\`
+
+          用法和改动说明见 / Usage and changes: [HEADLESS.md](https://github.com/$GITHUB_REPOSITORY/blob/$commit/HEADLESS.md)
+          NOTES
+          gh release create "$TAG" "$DIST/$NAME.tar.gz" "$DIST/$NAME.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "LLM Wiki headless $VERSION (Apple Silicon)" \
+            --notes-file "$RUNNER_TEMP/notes.md"

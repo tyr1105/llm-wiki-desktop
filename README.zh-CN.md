@@ -1,3 +1,5 @@
+> **关于这个分支：**这是 [tyr1105](https://github.com/tyr1105) 为 [xhs-wiki](https://github.com/tyr1105/xhs-wiki) 维护的 `headless` 分支，在上游 v2.0.6 的基础上增加了本机自动化接口和无窗口模式（`--serve-api --headless`）。它不是 LLM Wiki Desktop 的官方版本，说明见 [HEADLESS.md](HEADLESS.md)。想用桌面版，请到[上游的发布页](https://github.com/StoneLL1/llm-wiki-desktop/releases)下载。
+
 <div align="center">
   <img src="src/assets/app-logo.png" alt="LLM Wiki Desktop" width="88" />
   <h1>LLM Wiki Desktop</h1>
