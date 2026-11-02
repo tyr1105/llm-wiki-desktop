@@ -115,6 +115,36 @@ struct WorkspaceSourceInput {
 
 const WORKSPACE_SOURCE_INPUTS: &str = ".compile-source-inputs.json";
 
+/// 固定整理页面语言的环境变量（由启动后端的程序传给后端进程本身），不改界面语言。
+///
+/// 为什么需要：上游让 Agent 写页面时用全局设置里的界面语言
+/// （`~/.config/llm-wiki-desktop/settings.json` 的 `language`，没有这个文件时是 `en`），
+/// 知识库没有单独的语言设置。没装桌面版、或者桌面版是英文界面的人，整理出来的就是英文页面。
+/// 设了这个变量，Update Wiki 的规划、逐页生成和 log.md 摘要都按它的语言写，不再读界面语言。
+pub(crate) const CONTENT_LANGUAGE_ENV: &str = "LLM_WIKI_CONTENT_LANGUAGE";
+
+/// 解析整理语言的覆盖值：去掉首尾空白后只认 `zh-CN` 和 `en`。
+/// 没设、空值或其他写法（`zh`、`en-US` 等）一律视为没设，返回 None，照旧跟随界面语言。
+fn parse_content_language(raw: Option<&str>) -> Option<&'static str> {
+    match raw.map(str::trim) {
+        Some("zh-CN") => Some("zh-CN"),
+        Some("en") => Some("en"),
+        _ => None,
+    }
+}
+
+/// 决定这次整理用的语言：环境变量覆盖优先；没有有效覆盖时才读界面语言，
+/// 读设置失败按 `en`（上游原行为）。界面语言用闭包传入，有覆盖时就不读设置文件。
+fn resolve_content_language(
+    raw_override: Option<&str>,
+    ui_language: impl FnOnce() -> Option<String>,
+) -> String {
+    parse_content_language(raw_override)
+        .map(str::to_string)
+        .or_else(ui_language)
+        .unwrap_or_else(|| "en".to_string())
+}
+
 /// 把工作区 Markdown 拼进提示词时的用途。
 /// 规划（Planning）不需要日志正文，省略 wiki/log.md 的正文；
 /// 生成（Generation，即要整页产出 log.md 的旧清单/提示）必须看到全文，保持原样。
@@ -352,11 +382,16 @@ impl CompileService {
         services: &CompileExecutionServices<'_>,
         observer: &mut dyn CompileGenerationObserver,
     ) -> Result<CompileCandidate, BackendError> {
-        let language = services
-            .settings_service
-            .read_settings(context)
-            .map(|settings| settings.language)
-            .unwrap_or_else(|_| "en".to_string());
+        // 这是整条整理链路里唯一决定页面语言的地方：下面的规划提示、逐页生成提示、
+        // BYOK 提示和 log.md 摘要都用这个值。LLM_WIKI_CONTENT_LANGUAGE 有效时优先。
+        let raw_override = std::env::var(CONTENT_LANGUAGE_ENV).ok();
+        let language = resolve_content_language(raw_override.as_deref(), || {
+            services
+                .settings_service
+                .read_settings(context)
+                .ok()
+                .map(|settings| settings.language)
+        });
         let source_context = SourceContext::new(context, workspace, sources)?;
         // V8 改动集 C：第四项是候选审计记录。只有 Agent 路线的工作流逐页生成（log.md 由
         // 后端本地追加）才会产出它；BYOK 和旧的手动整理路线照旧没有。
@@ -5952,5 +5987,62 @@ mod tests {
             compile_agent_invocation(AgentKind::Codex, &workspace, "p", false).unwrap()
         );
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn content_language_env_accepts_only_zh_cn_and_en() {
+        // 变量名是对外约定（xhs-wiki 按这个名字传），改名会让调用方的设置悄悄失效。
+        assert_eq!(CONTENT_LANGUAGE_ENV, "LLM_WIKI_CONTENT_LANGUAGE");
+        for (raw, expected) in [
+            ("zh-CN", "zh-CN"),
+            ("en", "en"),
+            ("  zh-CN\n", "zh-CN"),
+            (" en ", "en"),
+        ] {
+            assert_eq!(parse_content_language(Some(raw)), Some(expected), "{raw:?}");
+        }
+        // 只认这两个写法：大小写不同、简写、带地区的英文和其他语言都当作没设。
+        for raw in [
+            "", "   ", "zh", "zh-cn", "ZH-CN", "zh-Hans", "zh-TW", "en-US", "EN", "ja", "fr",
+        ] {
+            assert_eq!(parse_content_language(Some(raw)), None, "{raw:?}");
+        }
+        assert_eq!(parse_content_language(None), None);
+    }
+
+    #[test]
+    fn content_language_override_wins_without_reading_ui_language() {
+        // 有效覆盖时不读设置文件：界面语言的闭包一旦被调用就让测试失败。
+        let unread =
+            || -> Option<String> { panic!("UI language must not be read when overridden") };
+        assert_eq!(resolve_content_language(Some("zh-CN"), unread), "zh-CN");
+        assert_eq!(
+            resolve_content_language(Some("en"), || Some("zh-CN".into())),
+            "en"
+        );
+        assert_eq!(
+            resolve_content_language(Some(" zh-CN "), || Some("en".into())),
+            "zh-CN"
+        );
+    }
+
+    #[test]
+    fn content_language_falls_back_to_ui_language_then_english() {
+        // 没设或写错：跟随界面语言（上游原行为）。
+        assert_eq!(
+            resolve_content_language(None, || Some("zh-CN".into())),
+            "zh-CN"
+        );
+        assert_eq!(
+            resolve_content_language(Some("fr"), || Some("zh-CN".into())),
+            "zh-CN"
+        );
+        assert_eq!(
+            resolve_content_language(Some(""), || Some("ja".into())),
+            "ja"
+        );
+        // 设置读不到：和上游一样回退英文。
+        assert_eq!(resolve_content_language(None, || None), "en");
+        assert_eq!(resolve_content_language(Some("zh"), || None), "en");
     }
 }

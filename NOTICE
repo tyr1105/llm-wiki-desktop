@@ -10,7 +10,9 @@ also licensed under the Apache License, Version 2.0: a loopback-only local
 automation API and windowless mode (--serve-api --headless), per-agent context
 budgets with bounded planning, read-only Claude compile invocations, compile
 audit records and structural page growth limits, agent failure
-classification, and parallel generation of derived pages.
+classification, parallel generation of derived pages, and an environment
+variable that pins the language of generated pages
+(LLM_WIKI_CONTENT_LANGUAGE).
 
 The modified and added files are listed in HEADLESS.md. The complete change
 history is the Git history of the "headless" branch.

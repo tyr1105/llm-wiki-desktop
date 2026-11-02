@@ -2,7 +2,7 @@
 
 [English summary](#english-summary)
 
-这个分支基于 [StoneLL1/llm-wiki-desktop](https://github.com/StoneLL1/llm-wiki-desktop) 的 `app-v2.0.6`，加了 7 个提交，让桌面版的后台可以**不开窗口**运行，并通过本机 HTTP 接口被其他程序调用。它是 [xhs-wiki](https://github.com/tyr1105/xhs-wiki) 的"LLM Wiki 引擎"所用的后台程序。
+这个分支基于 [StoneLL1/llm-wiki-desktop](https://github.com/StoneLL1/llm-wiki-desktop) 的 `app-v2.0.6`，加了 8 个提交，让桌面版的后台可以**不开窗口**运行，并通过本机 HTTP 接口被其他程序调用。它是 [xhs-wiki](https://github.com/tyr1105/xhs-wiki) 的"LLM Wiki 引擎"所用的后台程序。
 
 > 这不是 LLM Wiki Desktop 的官方版本，和上游作者没有关联。想用桌面版，请到[上游的发布页](https://github.com/StoneLL1/llm-wiki-desktop/releases)下载。
 
@@ -22,6 +22,7 @@
 
 ```bash
 export LLM_WIKI_API_TOKEN="$(openssl rand -hex 32)"   # 64 位十六进制令牌，只放在环境变量里
+export LLM_WIKI_CONTENT_LANGUAGE=zh-CN                 # 可选：整理出的页面固定用简体中文
 llm-wiki-desktop --serve-api --headless --api-port 18766 \
   --project-root /知识库/所在目录 --import-root /待导入文件/所在目录
 ```
@@ -31,6 +32,7 @@ llm-wiki-desktop --serve-api --headless --api-port 18766 \
 - 后台和桌面版共用同一个单实例锁和配置目录（`~/.config/llm-wiki-desktop/`）。桌面版开着的时候，后台会立即退出；后台运行期间，桌面版也打不开。
 - 无窗口模式下菜单栏仍会出现 LLM Wiki 图标。整理进行中请不要点图标菜单里的"退出"。
 - 整理用的 Agent（Claude Code 或 Codex）从 `PATH` 里查找；后台会去掉子进程的大部分环境变量，调用方需要自己保证 Agent 能找到登录信息（xhs-wiki 用包装脚本处理）。
+- 整理页面用的语言默认跟随全局设置里的界面语言（`~/.config/llm-wiki-desktop/settings.json` 的 `language`，没有这个文件时是英文），知识库本身没有语言设置。启动后台时设 `LLM_WIKI_CONTENT_LANGUAGE=zh-CN`（或 `en`）可以固定 Update Wiki 写页面的语言，不改界面语言；只认这两个值，其他值会被忽略、照旧跟随界面语言。xhs-wiki 固定传 `zh-CN`。
 
 ## 改了什么
 
@@ -43,8 +45,9 @@ llm-wiki-desktop --serve-api --headless --api-port 18766 \
 | 细分 Claude 和 Codex 调用失败的原因 | 区分上下文超限、额度用完、未登录，写进 `AGENT_EXIT_FAILED` 的 `agentFailureCategory` |
 | 修正上下文预算默认值和结构页闸门规则 | Claude 默认窗口 100 万 token；小页豁免、按来源数放宽增量、绝对体积上限 |
 | 派生专题页分批并行生成 | 每批最多 3 路并行（`LLM_WIKI_PAGE_PARALLELISM` 可设 1~4），一页失败即停下同批其他调用 |
+| 整理页面的语言可用环境变量固定 | `LLM_WIKI_CONTENT_LANGUAGE`（只认 `zh-CN` / `en`）优先于界面语言，决定 Update Wiki 的规划、逐页生成和 `wiki/log.md` 摘要用什么语言；不设时照旧跟随界面语言 |
 
-代码注释里的"V7""V8""V8.1"是这些补丁的批次名：V7 对应第 1 个提交，V8 对应第 2～6 个，V8.1 对应第 7 个。
+代码注释里的"V7""V8""V8.1"是这些补丁的批次名：V7 对应第 1 个提交，V8 对应第 2～6 个，V8.1 对应第 7 个；第 8 个提交没有批次名。
 
 <details>
 <summary>新增和修改的文件（Apache-2.0 第 4(b) 条要求的改动说明）</summary>
@@ -112,6 +115,6 @@ Apache License 2.0，见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。上游代码�
 
 ## English summary
 
-This `headless` branch is based on upstream `app-v2.0.6` of [StoneLL1/llm-wiki-desktop](https://github.com/StoneLL1/llm-wiki-desktop) plus 7 commits: a loopback-only automation API with a windowless mode (`--serve-api --headless`), per-agent context budgets with bounded planning, read-only Claude compile invocations, compile audit records and structural page growth limits, agent failure classification, and parallel generation of derived pages. It is the backend used by the LLM Wiki engine of [xhs-wiki](https://github.com/tyr1105/xhs-wiki).
+This `headless` branch is based on upstream `app-v2.0.6` of [StoneLL1/llm-wiki-desktop](https://github.com/StoneLL1/llm-wiki-desktop) plus 8 commits: a loopback-only automation API with a windowless mode (`--serve-api --headless`), per-agent context budgets with bounded planning, read-only Claude compile invocations, compile audit records and structural page growth limits, agent failure classification, parallel generation of derived pages, and an environment variable that pins the language of generated pages (`LLM_WIKI_CONTENT_LANGUAGE=zh-CN` or `en`; otherwise pages follow the UI language in the global settings). It is the backend used by the LLM Wiki engine of [xhs-wiki](https://github.com/tyr1105/xhs-wiki).
 
 It is **not** an official LLM Wiki Desktop release and is not affiliated with the upstream authors. Apple Silicon binaries are built by GitHub Actions on clean runners and published on the [Releases](https://github.com/tyr1105/llm-wiki-desktop/releases) page with SHA-256 checksums and build provenance attestations. The API is documented in [docs/local-api.md](docs/local-api.md). Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
